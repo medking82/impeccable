@@ -1,0 +1,59 @@
+name: Sync Personal Fork
+
+on:
+  schedule:
+    - cron: '7 */6 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: sync-personal-fork-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'medking82/impeccable' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the personal fork
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Merge upstream without rewriting fork history
+        id: sync
+        run: |
+          set -euo pipefail
+          git fetch --no-tags https://github.com/pbakaus/impeccable.git main
+          if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          base="$(git merge-base HEAD FETCH_HEAD)"
+          workflow_changes="$(git diff --name-only "$base" FETCH_HEAD -- .github/workflows)"
+          if [ -n "$workflow_changes" ]; then
+            printf 'Upstream workflow changes need review:\n%s\n' "$workflow_changes" >&2
+            exit 1
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if ! git merge --no-edit FETCH_HEAD; then
+            git merge --abort
+            exit 1
+          fi
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+
+      - name: Publish the merge
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh auth setup-git --hostname github.com
+          git push origin HEAD:refs/heads/main
