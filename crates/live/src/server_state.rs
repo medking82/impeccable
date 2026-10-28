@@ -575,7 +575,14 @@ impl ServerState {
 
     /// JS: getManualEditStatus()
     pub fn manual_edit_status(&self) -> Value {
-        let (total, per_page) = crate::manual_edits::buffer::count_by_page(&self.cwd, &self.env);
+        let buffer = match crate::manual_edits::buffer::read_buffer_strict(&self.cwd, &self.env) {
+            Ok(buffer) => buffer,
+            Err(message) => return json!({
+                "error": "manual_edit_buffer_unreadable", "message": message,
+                "lastActivity": self.manual_edit_activity.clone().unwrap_or(Value::Null),
+            }),
+        };
+        let (total, per_page) = crate::manual_edits::buffer::count_buffer(&buffer);
         json!({
             "totalCount": total,
             "perPage": per_page,

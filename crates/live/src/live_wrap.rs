@@ -274,7 +274,10 @@ fn wrap_cli(args: &[String], io: &mut Io) -> i32 {
     let mut original_lines: Vec<String> = lines[start_line..=end_line].to_vec();
 
     // Buffer-aware original.
-    let pending_entries = read_buffer(&cwd, &env);
+    let pending_entries = match read_buffer(&cwd, &env) {
+        Ok(entries) => entries,
+        Err(error) => { eprintln(io, &json_compact(&json!({ "error": error }))); return 1; }
+    };
     let target_abs = jsp::resolve(&cwd, &[&target_file]);
     if page_url.is_none() {
         let affecting = pending_entries

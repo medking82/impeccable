@@ -4,7 +4,7 @@
 
 use crate::inject::resolve_source_traits;
 use crate::paths::{live_dir, safe_session_id};
-use crate::pending_edits::{read_buffer, write_buffer};
+use crate::manual_edits::buffer::update_buffer;
 use crate::roots::enter_live_root;
 use crate::source_lock::with_source_lock;
 use crate::source_search::{find_source_file, is_generated_file, resolve_live_template_extensions};
@@ -94,7 +94,13 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
     if let Err(code) = enter_live_root(&mut argv, io) {
         return code;
     }
-    accept_cli(&argv, io)
+    if argv.iter().any(|arg| arg == "--help" || arg == "-h") { return accept_cli(&argv, io); }
+    let cwd = io.cwd.to_string_lossy().into_owned();
+    let env = io.env.clone();
+    match crate::manual_edits::apply::with_no_active_transaction(&cwd, &env, || Ok(accept_cli(&argv, io))) {
+        Ok(code) => code,
+        Err(error) => { eprintln(io, &json_compact(&json!({ "error": error }))); 1 }
+    }
 }
 
 fn nonempty(v: Option<String>) -> Option<String> {
@@ -511,12 +517,18 @@ fn accept_cli(args: &[String], io: &mut Io) -> i32 {
                         original
                     }
                 };
-                scrub_manual_edits_against_original_block(
+                if let Err(error) = scrub_manual_edits_against_original_block(
                     &accepted_original_text,
                     &cwd,
                     &env,
                     page_url.as_deref(),
-                );
+                ) {
+                    // The source has already been accepted. Report the partial
+                    // result without pretending the buffer was scrubbed.
+                    m.insert("manualEditsError".into(), Value::String(error));
+                    emit_result(io, Value::Object(m));
+                    return 1;
+                }
                 emit_result(io, Value::Object(m));
             }
         }
@@ -571,43 +583,24 @@ fn scrub_manual_edits_against_original_block(
     cwd: &str,
     env: &Env,
     page_url: Option<&str>,
-) {
-    if block.is_empty() {
-        return;
-    }
-    let Some(page_url) = page_url else { return };
-    let mut entries = read_buffer(cwd, env);
-    if entries.is_empty() {
-        return;
-    }
-    let mut mutated = false;
-    for entry in entries.iter_mut() {
-        if entry.get("pageUrl").and_then(|v| v.as_str()) != Some(page_url) {
-            continue;
+) -> Result<(), String> {
+    if block.is_empty() { return Ok(()); }
+    let Some(page_url) = page_url else { return Ok(()) };
+    update_buffer(cwd, env, |buffer| {
+        let mut mutated = false;
+        for entry in &mut buffer.entries {
+            if entry.get("pageUrl").and_then(Value::as_str) != Some(page_url) { continue; }
+            let ops = entry.get("ops").and_then(Value::as_array).cloned().unwrap_or_default();
+            let before = ops.len();
+            let kept: Vec<Value> = ops.into_iter().filter(|op| !manual_edit_op_appears_in_block(op, block)).collect();
+            if kept.len() != before { mutated = true; }
+            if let Value::Object(object) = entry { object.insert("ops".into(), Value::Array(kept)); }
         }
-        let ops: Vec<Value> = match entry.get("ops") {
-            Some(Value::Array(a)) => a.clone(),
-            _ => Vec::new(),
-        };
-        let before = ops.len();
-        let kept: Vec<Value> = ops
-            .into_iter()
-            .filter(|op| !manual_edit_op_appears_in_block(op, block))
-            .collect();
-        if kept.len() != before {
-            mutated = true;
+        if mutated {
+            buffer.entries.retain(|entry| matches!(entry.get("ops"), Some(Value::Array(ops)) if !ops.is_empty()));
         }
-        if let Value::Object(o) = entry {
-            o.insert("ops".into(), Value::Array(kept));
-        }
-    }
-    let entries: Vec<Value> = entries
-        .into_iter()
-        .filter(|e| matches!(e.get("ops"), Some(Value::Array(a)) if !a.is_empty()))
-        .collect();
-    if mutated {
-        write_buffer(cwd, env, &entries);
-    }
+        Ok(())
+    })
 }
 
 // ---------------------------------------------------------------------------

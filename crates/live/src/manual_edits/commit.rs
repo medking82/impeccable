@@ -5,7 +5,7 @@
 use crate::copy_edit_agent::{run_copy_edit_batch_agent, run_copy_edit_post_apply_checks};
 use crate::event_validation::truthy;
 use crate::manual_edits::buffer::{
-    count_by_page_value, read_buffer, read_buffer_strict, write_buffer, Buffer,
+    count_by_page_value_strict, read_buffer_strict, update_buffer,
 };
 use crate::manual_edits::evidence::{
     arr, build_manual_edit_evidence_value, collapse_ws, count_ops, ins, js_string_or_empty,
@@ -34,7 +34,6 @@ const ROLLBACK_SKIP_DIRS: [&str; 11] = [
     "node_modules",
     "out",
 ];
-const DEFAULT_REPAIR_ATTEMPTS: f64 = 3.0;
 
 // ---------------------------------------------------------------------------
 // Options
@@ -311,23 +310,6 @@ fn all_entry_ids(batch: &Value) -> Vec<Value> {
         .filter_map(|e| e.get("id").cloned())
         .filter(|v| truthy(Some(v)))
         .collect()
-}
-
-/// JS: repairAttemptLimit(env)
-fn repair_attempt_limit(env: &Env) -> f64 {
-    let raw = env
-        .get("IMPECCABLE_LIVE_MANUAL_EDIT_REPAIR_ATTEMPTS")
-        .cloned()
-        .unwrap_or_default();
-    let value = if raw.is_empty() {
-        DEFAULT_REPAIR_ATTEMPTS
-    } else {
-        impeccable_core::js::string_to_number(&raw)
-    };
-    if !value.is_finite() {
-        return DEFAULT_REPAIR_ATTEMPTS;
-    }
-    value.trunc().min(10.0).max(1.0)
 }
 
 fn slice_map<F: Fn(&Value) -> Value>(items: &[Value], limit: usize, f: F) -> Vec<Value> {
@@ -1181,24 +1163,88 @@ fn verification_failures_for_entries(
         .collect()
 }
 
-/// JS: clearAppliedEntries(cwd, appliedEntryIds)
-fn clear_applied_entries(cwd: &str, env: &Env, applied_entry_ids: &[Value]) -> usize {
+// Clear only an unchanged operation from the verified frozen batch. A newer
+// operation at the same ref survives with an explicit source-baseline conflict.
+fn clear_applied_entries(cwd: &str, env: &Env, batch: &Value, applied_entry_ids: &[Value]) -> Result<(usize, Vec<Value>), String> {
     let ids: HashSet<String> = applied_entry_ids.iter().map(|v| key_of(Some(v))).collect();
-    if ids.is_empty() {
-        return 0;
-    }
-    let buffer = read_buffer(cwd, env);
-    let mut cleared = 0usize;
-    let mut kept = Vec::new();
-    for entry in buffer.entries {
-        if ids.contains(&key_of(entry.get("id"))) {
-            cleared += arr(entry.get("ops")).len();
-        } else {
-            kept.push(entry);
+    let frozen_entries = get_arr(batch, "entries");
+    update_buffer(cwd, env, |buffer| {
+        let mut cleared = 0usize;
+        let mut conflicts = Vec::new();
+        for entry in &mut buffer.entries {
+            let id = entry.get("id").cloned();
+            let page = entry.get("pageUrl").cloned();
+            if !ids.contains(&key_of(id.as_ref())) { continue; }
+            let matching: Vec<&Value> = frozen_entries.iter().filter(|f| f.get("id") == id.as_ref() && f.get("pageUrl") == page.as_ref()).collect();
+            if matching.is_empty() { continue; }
+            if matching.len() != 1 { return Err("manual_edit_ambiguous_frozen_entry".into()); }
+            let frozen_ops = get_arr(matching[0], "ops");
+            let ops = entry.get_mut("ops").and_then(Value::as_array_mut).ok_or("manual_edit_buffer_invalid_ops")?;
+            let mut kept = Vec::new();
+            for mut op in ops.drain(..) {
+                let reference = op.get("ref").and_then(Value::as_str).filter(|s| !s.is_empty());
+                let matches: Vec<&Value> = frozen_ops.iter().filter(|f| reference.is_some() && f.get("ref").and_then(Value::as_str) == reference).collect();
+                if matches.is_empty() { kept.push(op); continue; }
+                if matches.len() != 1 { return Err("manual_edit_ambiguous_frozen_op".into()); }
+                let frozen = matches[0];
+                let old_revision = frozen.get("_impeccableRevision").and_then(Value::as_str).filter(|s| !s.is_empty());
+                let current_revision = op.get("_impeccableRevision").and_then(Value::as_str).filter(|s| !s.is_empty());
+                if old_revision.is_some() && old_revision == current_revision && &op == frozen {
+                    cleared += 1;
+                    continue;
+                }
+                let reference = reference.unwrap().to_string();
+                let reason = if old_revision.is_none() || current_revision.is_none() { "missing_revision" } else { "source_changed_during_apply" };
+                let object = op.as_object_mut().ok_or("manual_edit_buffer_invalid_op")?;
+                object.insert("_impeccableSourceConflict".into(), json!({"reason":reason}));
+                conflicts.push(json!({"id":id,"pageUrl":page,"ref":reference,"reason":reason}));
+                kept.push(op);
+            }
+            *ops = kept;
         }
+        buffer.entries.retain(|e| {
+            let targeted = ids.contains(&key_of(e.get("id"))) && frozen_entries.iter().any(|f| f.get("id") == e.get("id") && f.get("pageUrl") == e.get("pageUrl"));
+            !targeted || !matches!(e.get("ops"), Some(Value::Array(a)) if a.is_empty())
+        });
+        Ok((cleared, conflicts))
+    })
+}
+
+// Read-only preflight rejects removal, stale, conflicting or unversioned operations before dispatch.
+pub(crate) fn preflight_batch(cwd: &str, env: &Env, batch: &Value) -> Result<(), String> {
+    let frozen = get_arr(batch, "entries");
+    if frozen.iter().any(|entry| get_arr(entry, "ops").iter().any(|op| op.get("removeElement") == Some(&Value::Bool(true)))) {
+        return Err("remove_element_source_verification_unavailable".into());
     }
-    let _ = write_buffer(cwd, env, &Buffer { entries: kept });
-    cleared
+    let reasons = update_buffer(cwd, env, |buffer| {
+        let mut reasons = Vec::new();
+        for entry in frozen {
+            let id = entry.get("id");
+            let page = entry.get("pageUrl");
+            if id.is_none() || page.is_none() { reasons.push("invalid_entry"); continue; }
+            let current: Vec<&Value> = buffer.entries.iter().filter(|e| e.get("id") == id && e.get("pageUrl") == page).collect();
+            if current.len() != 1 { reasons.push("stale_entry"); continue; }
+            let current = current.into_iter().next().unwrap();
+            let ops = current.get("ops").and_then(Value::as_array).ok_or("manual_edit_buffer_invalid_ops")?;
+            for op in get_arr(&entry, "ops") {
+                let reference = op.get("ref").and_then(Value::as_str).filter(|s| !s.is_empty());
+                if reference.is_none() { reasons.push("invalid_ref"); continue; }
+                let positions: Vec<usize> = ops.iter().enumerate().filter_map(|(i, c)| (c.get("ref").and_then(Value::as_str) == reference).then_some(i)).collect();
+                if positions.len() != 1 { reasons.push("stale_op"); continue; }
+                let current = &ops[positions[0]];
+                if current.get("_impeccableSourceConflict").is_some() || op.get("_impeccableSourceConflict").is_some() { reasons.push("source_conflict"); continue; }
+                let old_revision = op.get("_impeccableRevision").and_then(Value::as_str).filter(|s| !s.is_empty());
+                let current_revision = current.get("_impeccableRevision").and_then(Value::as_str).filter(|s| !s.is_empty());
+                if old_revision.is_none() || current_revision.is_none() {
+                    reasons.push("missing_revision");
+                } else if old_revision != current_revision || &op != current {
+                    reasons.push("stale_op");
+                }
+            }
+        }
+        Ok(reasons)
+    })?;
+    if reasons.is_empty() { Ok(()) } else { Err(format!("manual_edit_preflight_failed: {}", reasons.join(","))) }
 }
 
 /// JS: snapshotRollbackFiles(cwd, files)
@@ -1371,6 +1417,20 @@ fn rollback_changed_files(
     extra_files: &[Value],
     scope_files: &[String],
 ) -> (Vec<String>, Vec<Value>) {
+    // Never auto-restore or delete source: a user or late agent may have changed it.
+    // Keep the existing implementation below for review, behind an immutable gate.
+    const AUTOMATIC_SOURCE_RESTORE_DISABLED: bool = true;
+    if AUTOMATIC_SOURCE_RESTORE_DISABLED {
+        let mut seen = HashSet::new();
+        let mut failures = Vec::new();
+        for file in scope_files.iter().map(|s| json!(s)).chain(extra_files.iter().cloned()) {
+            if let Some(relative) = normalize_rollback_path(cwd, &file) {
+                if seen.insert(relative.clone()) { failures.push(json!({"file":relative,"reason":"manual_recovery_required"})); }
+            }
+        }
+        if failures.is_empty() { failures.push(json!({"reason":"manual_recovery_required"})); }
+        return (Vec::new(), failures);
+    }
     let mut scope: Vec<String> = Vec::new();
     let mut scope_set: HashSet<String> = HashSet::new();
     for file in scope_files
@@ -1583,7 +1643,7 @@ struct RepairArgs<'a> {
     repair_failures: Vec<Value>,
 }
 
-fn repair_post_apply_validation(args: RepairArgs, agent: &mut Agent) -> Value {
+fn repair_post_apply_validation(args: RepairArgs, agent: &mut Agent) -> Result<Value, String> {
     let RepairArgs {
         batch,
         cwd,
@@ -1599,7 +1659,9 @@ fn repair_post_apply_validation(args: RepairArgs, agent: &mut Agent) -> Value {
         repair_reason,
         repair_failures,
     } = args;
-    let max_attempts = repair_attempt_limit(env);
+    // A further agent attempt could overwrite an intervening user change.
+    // Preserve the existing repair implementation but never auto-dispatch it.
+    let max_attempts = 0.0f64;
     let mut current_files = unique_str_list(&files);
     let mut current_applied_ids = unique_str_list(&applied_entry_ids);
     let mut current_failed = failed;
@@ -1666,8 +1728,8 @@ fn repair_post_apply_validation(args: RepairArgs, agent: &mut Agent) -> Value {
             continue;
         }
 
-        let cleared = clear_applied_entries(cwd, env, &verified.verified_ids);
-        let counts = count_by_page_value(cwd, env);
+        let (cleared, conflicts) = clear_applied_entries(cwd, env, batch, &verified.verified_ids)?;
+        let counts = count_by_page_value_strict(cwd, env)?;
         let verified_id_set: HashSet<String> = verified
             .verified_ids
             .iter()
@@ -1693,6 +1755,11 @@ fn repair_post_apply_validation(args: RepairArgs, agent: &mut Agent) -> Value {
         m.insert("pageUrl".into(), page_url.clone());
         m.insert("warnings".into(), Value::Array(current_warnings));
         m.insert("notes".into(), Value::Array(current_notes));
+        if !conflicts.is_empty() {
+            m.insert("conflicts".into(), Value::Array(conflicts));
+            m.insert("needsManualDecision".into(), Value::Bool(true));
+            m.insert("recoveryRequired".into(), Value::Bool(true));
+        }
         m.insert(
             "repair".into(),
             json!({
@@ -1705,7 +1772,7 @@ fn repair_post_apply_validation(args: RepairArgs, agent: &mut Agent) -> Value {
         for (k, v) in counts {
             m.insert(k, v);
         }
-        return Value::Object(m);
+        return Ok(Value::Object(m));
     }
 
     let decision_failed_entries: Vec<Value> = if !current_applied_ids.is_empty() {
@@ -1754,6 +1821,7 @@ fn repair_post_apply_validation(args: RepairArgs, agent: &mut Agent) -> Value {
     m.insert("notes".into(), Value::Array(current_notes));
     m.insert("reason".into(), json!("manual_edit_repair_needs_decision"));
     m.insert("needsManualDecision".into(), Value::Bool(true));
+    m.insert("recoveryRequired".into(), Value::Bool(true));
     let mut repair = Map::new();
     repair.insert("status".into(), json!("needs_decision"));
     repair.insert("attempts".into(), crate::util::js_num(max_attempts));
@@ -1771,10 +1839,10 @@ fn repair_post_apply_validation(args: RepairArgs, agent: &mut Agent) -> Value {
     );
     repair.insert("files".into(), Value::Array(to_values(&current_files)));
     m.insert("repair".into(), Value::Object(repair));
-    for (k, v) in count_by_page_value(cwd, env) {
+    for (k, v) in count_by_page_value_strict(cwd, env)? {
         m.insert(k, v);
     }
-    Value::Object(m)
+    Ok(Value::Object(m))
 }
 
 // ---------------------------------------------------------------------------
@@ -1808,30 +1876,36 @@ fn run_commit(
     transaction_id: Option<&str>,
     provided_batch: Option<&Value>,
 ) -> Result<Value, String> {
-    if let Err(message) = read_buffer_strict(cwd, env) {
-        let mut m = base_result(vec![], vec![], vec![], 0, 0, &page_url);
-        m.insert("reason".into(), json!("manual_edit_buffer_invalid"));
-        m.insert("message".into(), json!(message));
-        for (k, v) in count_by_page_value(cwd, env) {
-            m.insert(k, v);
-        }
-        return Ok(Value::Object(m));
-    }
+    read_buffer_strict(cwd, env)?;
 
     let batch = match provided_batch {
         Some(b) if truthy(Some(b)) => b.clone(),
-        _ => build_manual_edit_evidence_value(cwd, env, &page_url),
+        _ => build_manual_edit_evidence_value(cwd, env, &page_url)?,
     };
     let count = count_ops(&get_arr(&batch, "entries"));
     if count == 0 {
         let mut m = base_result(vec![], vec![], vec![], 0, 0, &page_url);
         m.insert("reason".into(), json!("no_pending_edits"));
-        for (k, v) in count_by_page_value(cwd, env) {
+        for (k, v) in count_by_page_value_strict(cwd, env)? {
             m.insert(k, v);
         }
         return Ok(Value::Object(m));
     }
 
+    // A rendered element and its source hint do not identify a verifiable
+    // source-node range (especially for mapped or conditional content). Do
+    // not send removals to an agent until source-level deletion can be proven.
+    // Returning an error also lets the live server roll back an existing
+    // transaction while leaving the staged edits available for Undo.
+    if get_arr(&batch, "entries").iter().any(|entry| {
+        get_arr(entry, "ops")
+            .iter()
+            .any(|op| op.get("removeElement") == Some(&Value::Bool(true)))
+    }) {
+        return Err("remove_element_source_verification_unavailable".into());
+    }
+
+    preflight_batch(cwd, env, &batch)?;
     let base_rollback_scope = collect_apply_owned_files(&batch, cwd, &[]);
     let rollback_snapshot = snapshot_rollback_files(cwd, Some(&base_rollback_scope));
 
@@ -1877,7 +1951,9 @@ fn run_commit(
                 Value::Array(to_values(&rolled_back_files)),
             );
             m.insert("rollbackFailures".into(), Value::Array(rollback_failures));
-            for (k, v) in count_by_page_value(cwd, env) {
+        m.insert("needsManualDecision".into(), Value::Bool(true));
+        m.insert("recoveryRequired".into(), Value::Bool(true));
+            for (k, v) in count_by_page_value_strict(cwd, env)? {
                 m.insert(k, v);
             }
             return Ok(Value::Object(m));
@@ -1911,7 +1987,9 @@ fn run_commit(
             Value::Array(to_values(&rolled_back_files)),
         );
         m.insert("rollbackFailures".into(), Value::Array(rollback_failures));
-        for (k, v) in count_by_page_value(cwd, env) {
+        m.insert("needsManualDecision".into(), Value::Bool(true));
+        m.insert("recoveryRequired".into(), Value::Bool(true));
+        for (k, v) in count_by_page_value_strict(cwd, env)? {
             m.insert(k, v);
         }
         return Ok(Value::Object(m));
@@ -1967,7 +2045,9 @@ fn run_commit(
             Value::Array(to_values(&rolled_back_files)),
         );
         m.insert("rollbackFailures".into(), Value::Array(rollback_failures));
-        for (k, v) in count_by_page_value(cwd, env) {
+        m.insert("needsManualDecision".into(), Value::Bool(true));
+        m.insert("recoveryRequired".into(), Value::Bool(true));
+        for (k, v) in count_by_page_value_strict(cwd, env)? {
             m.insert(k, v);
         }
         return Ok(Value::Object(m));
@@ -1999,7 +2079,9 @@ fn run_commit(
             Value::Array(to_values(&rolled_back_files)),
         );
         m.insert("rollbackFailures".into(), Value::Array(rollback_failures));
-        for (k, v) in count_by_page_value(cwd, env) {
+        m.insert("needsManualDecision".into(), Value::Bool(true));
+        m.insert("recoveryRequired".into(), Value::Bool(true));
+        for (k, v) in count_by_page_value_strict(cwd, env)? {
             m.insert(k, v);
         }
         return Ok(Value::Object(m));
@@ -2021,7 +2103,9 @@ fn run_commit(
             Value::Array(to_values(&rolled_back_files)),
         );
         m.insert("rollbackFailures".into(), Value::Array(rollback_failures));
-        for (k, v) in count_by_page_value(cwd, env) {
+        m.insert("needsManualDecision".into(), Value::Bool(true));
+        m.insert("recoveryRequired".into(), Value::Bool(true));
+        for (k, v) in count_by_page_value_strict(cwd, env)? {
             m.insert(k, v);
         }
         return Ok(Value::Object(m));
@@ -2036,7 +2120,7 @@ fn run_commit(
         .collect();
 
     if !reported_applied_ids.is_empty() && reported_files.is_empty() {
-        return Ok(repair_post_apply_validation(
+        return repair_post_apply_validation(
             RepairArgs {
                 batch: &batch,
                 cwd,
@@ -2058,7 +2142,7 @@ fn run_commit(
                 ),
             },
             agent,
-        ));
+        );
     }
 
     let mut verified_applied_ids: Vec<Value> = Vec::new();
@@ -2137,7 +2221,7 @@ fn run_commit(
                 ins(&mut m, "id", entry.get("id").cloned());
                 m.insert(
                     "reason".into(),
-                    json!("rolled_back_due_to_failed_entry_source_changed"),
+                    json!("manual_recovery_required_after_failed_entry_source_changed"),
                 );
                 m.insert(
                     "candidates".into(),
@@ -2175,14 +2259,16 @@ fn run_commit(
             Value::Array(to_values(&rolled_back_files)),
         );
         m.insert("rollbackFailures".into(), Value::Array(rollback_failures));
-        for (k, v) in count_by_page_value(cwd, env) {
+        m.insert("needsManualDecision".into(), Value::Bool(true));
+        m.insert("recoveryRequired".into(), Value::Bool(true));
+        for (k, v) in count_by_page_value_strict(cwd, env)? {
             m.insert(k, v);
         }
         return Ok(Value::Object(m));
     }
 
     if !verification_failed.is_empty() {
-        return Ok(repair_post_apply_validation(
+        return repair_post_apply_validation(
             RepairArgs {
                 batch: &batch,
                 cwd,
@@ -2199,7 +2285,7 @@ fn run_commit(
                 repair_failures: verification_failed.clone(),
             },
             agent,
-        ));
+        );
     }
 
     let post_check_files = unique_strings(&result_files);
@@ -2232,7 +2318,7 @@ fn run_commit(
         };
         let mut warnings = result_warnings.clone();
         warnings.extend(arr(post_checks.get("warnings")));
-        return Ok(repair_post_apply_validation(
+        return repair_post_apply_validation(
             RepairArgs {
                 batch: &batch,
                 cwd,
@@ -2249,11 +2335,11 @@ fn run_commit(
                 repair_failures: arr(post_checks.get("failures")),
             },
             agent,
-        ));
+        );
     }
 
-    let cleared = clear_applied_entries(cwd, env, &verified_applied_ids);
-    let counts = count_by_page_value(cwd, env);
+    let (cleared, conflicts) = clear_applied_entries(cwd, env, &batch, &verified_applied_ids)?;
+    let counts = count_by_page_value_strict(cwd, env)?;
     let mut m = base_result(
         summarize_applied_entries(&get_arr(&batch, "entries"), &verified_applied_ids),
         failed,
@@ -2266,8 +2352,206 @@ fn run_commit(
     warnings.extend(arr(post_checks.get("warnings")));
     m.insert("warnings".into(), Value::Array(warnings));
     m.insert("notes".into(), Value::Array(result_notes));
+    if !conflicts.is_empty() {
+        m.insert("conflicts".into(), Value::Array(conflicts));
+        m.insert("needsManualDecision".into(), Value::Bool(true));
+        m.insert("recoveryRequired".into(), Value::Bool(true));
+    }
     for (k, v) in counts {
         m.insert(k, v);
     }
     Ok(Value::Object(m))
+}
+
+#[cfg(test)]
+mod removal_guard_tests {
+    use super::*;
+    use crate::manual_edits::buffer::{read_buffer, stage_entry};
+    use std::cell::Cell;
+
+    #[test]
+    fn removal_is_rejected_before_agent_and_pending_edits_remain() {
+        let dir = std::env::temp_dir().join(format!(
+            "impeccable-removal-guard-{}", std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cwd = dir.to_string_lossy().into_owned();
+        let env = Env::new();
+        let entry = json!({ "id": "e1", "pageUrl": "/", "element": {}, "ops": [
+            { "ref": "section", "tag": "section", "originalText": "Sale", "deleted": true,
+              "removeElement": true, "sourceHint": { "file": "page.jsx", "line": 1 } }
+        ] });
+        stage_entry(&cwd, &env, &entry).unwrap();
+        let batch = json!({ "entries": [entry] });
+        let called = Cell::new(false);
+        let mut callback = |_: &Value, _: Option<&Value>| -> Result<Value, String> {
+            called.set(true);
+            Ok(json!({}))
+        };
+        let result = commit_manual_edits(CommitOptions {
+            cwd: &cwd, env: &env, page_url: Some("/"), provider: Some("chat"),
+            timeout_ms: None, apply_batch_to_source: Some(&mut callback),
+            chat_available: None, repair_only: false, transaction_id: None,
+            batch: Some(&batch),
+        });
+        assert_eq!(result.unwrap_err(), "remove_element_source_verification_unavailable");
+        assert!(!called.get());
+        assert_eq!(read_buffer(&cwd, &env).entries.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod concurrent_edit_regression_tests {
+    use super::*;
+    use crate::manual_edits::buffer::{read_buffer, stage_entry};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn new_edit_staged_during_commit_remains_pending_after_old_edit_applies() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("impeccable-concurrent-edit-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let cwd = dir.to_string_lossy().into_owned();
+        let env = Env::new();
+        let source = dir.join("page.html");
+        std::fs::write(&source, "<p>Alpha</p>\n").unwrap();
+        let old = json!({ "id": "e1", "pageUrl": "/", "element": {}, "ops": [
+            { "ref": "main>p", "tag": "p", "originalText": "Alpha", "newText": "Bravo",
+              "sourceHint": { "file": "page.html", "line": 1 } }
+        ] });
+        stage_entry(&cwd, &env, &old).unwrap();
+        let batch = json!({ "entries": read_buffer(&cwd, &env).entries, "candidates": [] });
+        let mut callback = |_: &Value, repair: Option<&Value>| -> Result<Value, String> {
+            assert!(repair.is_none(), "the initial edit should verify without repair");
+            let newer = json!({ "id": "e2", "pageUrl": "/", "element": {}, "ops": [
+                { "ref": "main>p", "tag": "p", "originalText": "Bravo", "newText": "Charlie",
+                  "sourceHint": { "file": "page.html", "line": 1 } }
+            ] });
+            stage_entry(&cwd, &env, &newer)?;
+            std::fs::write(&source, "<p>Bravo</p>\n").map_err(|e| e.to_string())?;
+            Ok(json!({ "status": "done", "appliedEntryIds": ["e1"], "failed": [],
+                       "files": ["page.html"], "notes": [] }))
+        };
+        let result = commit_manual_edits(CommitOptions {
+            cwd: &cwd, env: &env, page_url: Some("/"), provider: Some("chat"),
+            timeout_ms: None, apply_batch_to_source: Some(&mut callback),
+            chat_available: None, repair_only: false, transaction_id: None,
+            batch: Some(&batch),
+        }).unwrap();
+        assert_eq!(result["failed"], json!([]), "old edit must pass validation: {result}");
+        assert_eq!(result["applied"][0]["newText"], "Bravo", "old edit must apply: {result}");
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "<p>Bravo</p>\n");
+        let pending = read_buffer(&cwd, &env);
+        assert_eq!(pending.entries.len(), 1, "the later edit must not be cleared; fixture={cwd}");
+        assert_eq!(pending.entries[0]["ops"][0]["ref"], "main>p");
+        assert_eq!(pending.entries[0]["ops"][0]["newText"], "Charlie");
+    }
+}
+#[cfg(test)]
+mod transaction_safety_regression_tests {
+    use super::*;
+    use crate::manual_edits::buffer::{buffer_path, read_buffer, stage_entry, write_buffer, Buffer};
+    use std::cell::Cell;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn fixture(label: &str) -> (String, Env, std::path::PathBuf) {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("impeccable-safety-{label}-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let source = dir.join("page.html");
+        std::fs::write(&source, "<p>Alpha</p>\n").unwrap();
+        (dir.to_string_lossy().into_owned(), Env::new(), source)
+    }
+    fn entry(id: &str, page: &str, reference: &str, original: &str, new_text: &str) -> Value {
+        json!({"id":id,"pageUrl":page,"element":{},"ops":[{"ref":reference,"tag":"p", "originalText":original,"newText":new_text,"sourceHint":{"file":"page.html","line":1}}]})
+    }
+    fn frozen(cwd: &str, env: &Env) -> Value {
+        json!({"entries":read_buffer(cwd,env).entries,"candidates":[]})
+    }
+    fn options<'a>(cwd: &'a str, env: &'a Env, batch: &'a Value, callback: &'a mut dyn FnMut(&Value,Option<&Value>)->Result<Value,String>) -> CommitOptions<'a> {
+        CommitOptions {cwd,env,page_url:Some("/"),provider:Some("chat"),timeout_ms:None,apply_batch_to_source:Some(callback),chat_available:None,repair_only:false,transaction_id:None,batch:Some(batch)}
+    }
+    fn done() -> Value { json!({"status":"done","appliedEntryIds":["e1"],"failed":[],"files":["page.html"],"notes":[]}) }
+
+    #[test]
+    fn aba_revision_is_not_cleared_and_conflict_blocks_retry() {
+        let (cwd, env, source)=fixture("aba");
+        stage_entry(&cwd,&env,&entry("e1","/","main>p","Alpha","Bravo")).unwrap();
+        let batch=frozen(&cwd,&env);
+        let old_revision=batch["entries"][0]["ops"][0]["_impeccableRevision"].clone();
+        let mut callback=|_:&Value,_:Option<&Value>|->Result<Value,String>{
+            stage_entry(&cwd,&env,&entry("e2","/","main>p","Bravo","Charlie"))?;
+            stage_entry(&cwd,&env,&entry("e3","/","main>p","Alpha","Bravo"))?;
+            std::fs::write(&source,"<p>Bravo</p>\n").map_err(|e|e.to_string())?;
+            Ok(done())
+        };
+        let result=commit_manual_edits(options(&cwd,&env,&batch,&mut callback)).unwrap();
+        assert_eq!(result["applied"][0]["newText"],"Bravo");
+        assert_eq!(result["needsManualDecision"],true);
+        let pending=read_buffer(&cwd,&env);
+        assert_eq!(pending.entries.len(),1);
+        let op=&pending.entries[0]["ops"][0];
+        assert_eq!(op["newText"],"Bravo");
+        assert_ne!(op["_impeccableRevision"],old_revision);
+        assert_eq!(op["_impeccableSourceConflict"]["reason"],"source_changed_during_apply");
+        let retry=frozen(&cwd,&env);
+        let called=Cell::new(false);
+        let mut retry_callback=|_:&Value,_:Option<&Value>|->Result<Value,String>{called.set(true);Ok(done())};
+        let error=commit_manual_edits(options(&cwd,&env,&retry,&mut retry_callback)).unwrap_err();
+        assert!(error.contains("source_conflict"),"{error}");
+        assert!(!called.get());
+    }
+    #[test]
+    fn later_other_ref_and_other_page_survive_without_being_cleared() {
+        let (cwd,env,source)=fixture("other");
+        stage_entry(&cwd,&env,&entry("e1","/","main>p","Alpha","Bravo")).unwrap();
+        let batch=frozen(&cwd,&env);
+        let mut callback=|_:&Value,_:Option<&Value>|->Result<Value,String>{
+            stage_entry(&cwd,&env,&entry("e1","/","main>h1","Title","New title"))?;
+            stage_entry(&cwd,&env,&entry("e2","/other","main>p","Other","New other"))?;
+            std::fs::write(&source,"<p>Bravo</p>\n").map_err(|e|e.to_string())?;Ok(done())
+        };
+        let result=commit_manual_edits(options(&cwd,&env,&batch,&mut callback)).unwrap();
+        assert_eq!(result["failed"],json!([]));assert_eq!(result["cleared"],1);
+        let pending=read_buffer(&cwd,&env);assert_eq!(pending.entries.len(),2);
+        assert!(pending.entries.iter().any(|e|e["pageUrl"]=="/" && e["ops"][0]["ref"]=="main>h1"));
+        assert!(pending.entries.iter().any(|e|e["pageUrl"]=="/other" && e["ops"][0]["newText"]=="New other"));
+    }
+    #[test]
+    fn failure_never_restores_snapshot_over_concurrent_source() {
+        let (cwd,env,source)=fixture("failure");stage_entry(&cwd,&env,&entry("e1","/","main>p","Alpha","Bravo")).unwrap();let batch=frozen(&cwd,&env);
+        let mut callback=|_:&Value,_:Option<&Value>|->Result<Value,String>{std::fs::write(&source,"<p>User change</p>\n").map_err(|e|e.to_string())?;Err("agent failed".into())};
+        let result=commit_manual_edits(options(&cwd,&env,&batch,&mut callback)).unwrap();
+        assert_eq!(std::fs::read_to_string(&source).unwrap(),"<p>User change</p>\n");
+        assert_eq!(result["rolledBackFiles"],json!([]));assert_eq!(result["needsManualDecision"],true);assert_eq!(result["recoveryRequired"],true);
+        assert_eq!(read_buffer(&cwd,&env).entries.len(),1);
+    }
+    #[test]
+    fn unversioned_entry_is_preserved_and_blocks_dispatch() {
+        let (cwd,env,_)=fixture("legacy");let old=entry("e1","/","main>p","Alpha","Bravo");
+        write_buffer(&cwd,&env,&Buffer{entries:vec![old.clone()]}).unwrap();let batch=json!({"entries":[old]});
+        let called=Cell::new(false);let mut callback=|_:&Value,_:Option<&Value>|->Result<Value,String>{called.set(true);Ok(done())};
+        let err=commit_manual_edits(options(&cwd,&env,&batch,&mut callback)).unwrap_err();assert!(err.contains("missing_revision"),"{err}");assert!(!called.get());
+        let pending=read_buffer(&cwd,&env);assert_eq!(pending.entries.len(),1);assert!(pending.entries[0]["ops"][0].get("_impeccableSourceConflict").is_none());
+    }
+    #[test]
+    fn corrupted_buffer_fails_without_dispatch_or_overwrite() {
+        let (cwd,env,_)=fixture("corrupt");stage_entry(&cwd,&env,&entry("e1","/","main>p","Alpha","Bravo")).unwrap();
+        let path=buffer_path(&cwd,&env);let damaged=b"{invalid json";std::fs::write(&path,damaged).unwrap();
+        let batch=json!({"entries":[]});let called=Cell::new(false);let mut callback=|_:&Value,_:Option<&Value>|->Result<Value,String>{called.set(true);Ok(done())};
+        assert!(commit_manual_edits(options(&cwd,&env,&batch,&mut callback)).is_err());assert!(!called.get());assert_eq!(std::fs::read(path).unwrap(),damaged);
+    }
+    #[test]
+    fn failed_validation_does_not_dispatch_automatic_repair() {
+        let (cwd,env,source)=fixture("no-auto-repair");
+        stage_entry(&cwd,&env,&entry("e1","/","main>p","Alpha","Bravo")).unwrap();
+        let batch=frozen(&cwd,&env);let calls=Cell::new(0);
+        let mut callback=|_:&Value,_:Option<&Value>|->Result<Value,String>{calls.set(calls.get()+1);Ok(done())};
+        let result=commit_manual_edits(options(&cwd,&env,&batch,&mut callback)).unwrap();
+        assert_eq!(calls.get(),1);assert_eq!(result["needsManualDecision"],true);
+        assert_eq!(result["recoveryRequired"],true);assert_eq!(std::fs::read_to_string(source).unwrap(),"<p>Alpha</p>\n");
+        assert_eq!(read_buffer(&cwd,&env).entries.len(),1);
+    }
 }

@@ -4,7 +4,7 @@
 
 use crate::event_validation::truthy;
 use crate::live_commit_manual_edits::arg_val;
-use crate::manual_edits::buffer::{read_buffer, remove_entries, truncate_buffer};
+use crate::manual_edits::buffer::update_buffer;
 use crate::util::{json_compact, println};
 use impeccable_common::Io;
 use serde_json::{json, Map, Value};
@@ -22,33 +22,25 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
     let env = io.env.clone();
     let page_url_filter = arg_val(args, "--page-url");
 
-    let buffer = read_buffer(&cwd, &env);
-    let (entries, discarded) = if truthy(Some(&page_url_filter)) {
-        let matches = |entry: &Value| entry.get("pageUrl") == Some(&page_url_filter);
-        let entries: Vec<Value> = buffer
-            .entries
-            .iter()
-            .filter(|e| matches(e))
-            .cloned()
-            .collect();
-        let discarded = remove_entries(&cwd, &env, matches).unwrap_or(0);
-        (entries, discarded)
-    } else {
-        let entries = buffer.entries.clone();
-        let discarded = truncate_buffer(&cwd, &env).unwrap_or(0);
-        (entries, discarded)
+    let result = crate::manual_edits::apply::with_no_active_transaction(&cwd, &env, || update_buffer(&cwd, &env, |buffer| {
+        let mut entries = Vec::new();
+        let mut kept = Vec::new();
+        let mut discarded = 0usize;
+        for entry in std::mem::take(&mut buffer.entries) {
+            let matches = !truthy(Some(&page_url_filter)) || entry.get("pageUrl") == Some(&page_url_filter);
+            if matches {
+                discarded += entry.get("ops").and_then(Value::as_array).map_or(0, Vec::len);
+                entries.push(entry);
+            } else { kept.push(entry); }
+        }
+        let remaining = kept.iter().map(|entry| entry.get("ops").and_then(Value::as_array).map_or(0, Vec::len)).sum::<usize>();
+        buffer.entries = kept;
+        Ok((entries, discarded, remaining))
+    }));
+    let (entries, discarded, remaining) = match result {
+        Ok(result) => result,
+        Err(error) => { io.err(&format!("{error}\n")); return 1; }
     };
-
-    let remaining: usize = read_buffer(&cwd, &env)
-        .entries
-        .iter()
-        .map(|e| {
-            e.get("ops")
-                .and_then(|o| o.as_array())
-                .map(|a| a.len())
-                .unwrap_or(0)
-        })
-        .sum();
 
     let mut m = Map::new();
     m.insert("discarded".into(), json!(discarded));

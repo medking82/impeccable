@@ -2097,8 +2097,14 @@ fn handle_manual_edit_route(
                 return;
             }
             let page_url = req.query_get("pageUrl").unwrap_or("");
-            let (total, per_page) = manual_buffer::count_by_page(&cwd, &env);
-            let buffer = manual_buffer::read_buffer(&cwd, &env);
+            let buffer = match manual_buffer::read_buffer_strict(&cwd, &env) {
+                Ok(buffer) => buffer,
+                Err(message) => {
+                    respond(stream, cors, json_res(500, json!({ "error": "manual_edit_buffer_unreadable", "message": message })));
+                    return;
+                }
+            };
+            let (total, per_page) = manual_buffer::count_buffer(&buffer);
             let entries: Vec<Value> = if !page_url.is_empty() {
                 buffer
                     .entries
@@ -2225,7 +2231,8 @@ fn handle_manual_edit_route(
                     return;
                 }
                 let (entries, discarded) =
-                    match manual_buffer::remove_ops_by_ref(&cwd, &env, pu, r) {
+                    match manual_apply::with_no_active_transaction(&cwd, &env, ||
+                        manual_buffer::remove_ops_by_ref(&cwd, &env, pu, r)) {
                         Ok(v) => v,
                         Err(e) => {
                             drop(st);
@@ -2256,12 +2263,24 @@ fn handle_manual_edit_route(
                 return;
             }
             let mut st = lock(shared);
-            let buffer = manual_buffer::read_buffer(&cwd, &env);
+            let buffer = match manual_buffer::read_buffer_strict(&cwd, &env) {
+                Ok(buffer) => buffer,
+                Err(message) => {
+                    drop(st);
+                    respond(stream, cors, json_res(500, json!({ "error": "manual_edit_buffer_unreadable", "message": message })));
+                    return;
+                }
+            };
             let transaction_rollback = manual_apply::rollback_transaction(
                 &mut st,
                 page_url.as_deref(),
                 "manual_edit_discarded",
             );
+            if transaction_rollback.as_ref().and_then(|r| r.get("recoveryRequired")) == Some(&Value::Bool(true)) {
+                drop(st);
+                respond(stream, cors, json_res(409, json!({ "error": "manual_edit_recovery_required", "transaction": transaction_rollback })));
+                return;
+            }
             let (discarded_entries, discarded): (Vec<Value>, usize) = match page_url.as_deref() {
                 Some(pu) => {
                     let entries: Vec<Value> = buffer
@@ -2270,9 +2289,10 @@ fn handle_manual_edit_route(
                         .filter(|e| e.get("pageUrl").and_then(|p| p.as_str()) == Some(pu))
                         .cloned()
                         .collect();
-                    let n = match manual_buffer::remove_entries(&cwd, &env, |e| {
-                        e.get("pageUrl").and_then(|p| p.as_str()) == Some(pu)
-                    }) {
+                    let n = match manual_apply::with_no_active_transaction(&cwd, &env, ||
+                        manual_buffer::remove_entries(&cwd, &env, |e| {
+                            e.get("pageUrl").and_then(|p| p.as_str()) == Some(pu)
+                        })) {
                         Ok(n) => n,
                         Err(e) => {
                             drop(st);
@@ -2287,7 +2307,8 @@ fn handle_manual_edit_route(
                     (entries, n)
                 }
                 None => {
-                    let n = match manual_buffer::truncate_buffer(&cwd, &env) {
+                    let n = match manual_apply::with_no_active_transaction(&cwd, &env, ||
+                        manual_buffer::truncate_buffer(&cwd, &env)) {
                         Ok(n) => n,
                         Err(e) => {
                             drop(st);
@@ -2384,6 +2405,14 @@ fn handle_manual_edit_commit(
     let page_url_val = page_url.as_deref().map(|s| json!(s)).unwrap_or(Value::Null);
     let async_mode = flag_truthy(req.query_get("async"));
     let repair_only = flag_truthy(req.query_get("repair"));
+    let transaction_path = manual_apply::manual_apply_transaction_path(cwd, env);
+    match std::fs::metadata(&transaction_path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        _ => {
+            respond(stream, cors, json_res(409, json!({ "error": "manual_edit_recovery_required" })));
+            return;
+        }
+    }
     let existing_transaction = manual_apply::read_manual_apply_transaction(cwd, env);
     if repair_only && existing_transaction.is_none() {
         respond(
@@ -2406,9 +2435,17 @@ fn handle_manual_edit_commit(
             "manual_edit_commit_recovered_abandoned_transaction",
         )
     };
-    let before = st.manual_edit_status();
-    let before_total = before.get("totalCount").cloned().unwrap_or(json!(0));
-    let before_per_page = before.get("perPage").cloned().unwrap_or(json!({}));
+    let before_buffer = match manual_buffer::read_buffer_strict(cwd, env) {
+        Ok(buffer) => buffer,
+        Err(message) => {
+            drop(st);
+            respond(stream, cors, json_res(500, json!({ "error": "manual_edit_buffer_unreadable", "message": message })));
+            return;
+        }
+    };
+    let (before_count, before_pages) = manual_buffer::count_buffer(&before_buffer);
+    let before_total = json!(before_count);
+    let before_per_page = Value::Object(before_pages);
     let pending_count: u64 = match page_url.as_deref() {
         Some(pu) => before_per_page
             .get(pu)
@@ -2455,8 +2492,47 @@ fn handle_manual_edit_commit(
     // while the evidence build below reads the buffer outside the lock.
     st.begin_commit(page_url.as_deref());
     drop(st);
-    // The commit itself waits on an agent (JS: awaited); later requests must
-    // not queue behind it.
+    // Keep the mutation ticket only through strict evidence preflight and
+    // transaction creation; it is always released before waiting on an agent.
+    let mut routed_provider = "subprocess";
+    let mut transaction: Option<Value> = None;
+    let commit_batch: Option<Value> = {
+        let transaction_batch = match crate::manual_edits::evidence::build_manual_edit_evidence(cwd, env, page_url.as_deref()) {
+            Ok(batch) => batch,
+            Err(message) => {
+                let mut st = lock(shared);
+                st.end_commit(page_url.as_deref());
+                drop(st);
+                respond(stream, cors, json_res(500, json!({ "error": "manual_edit_evidence_failed", "message": message })));
+                return;
+            }
+        };
+        if !repair_only && manual_apply::count_manual_apply_ops(&transaction_batch) > 0 {
+            if let Err(message) = crate::manual_edits::commit::preflight_batch(cwd, env, &transaction_batch) {
+                let mut st = lock(shared);
+                st.end_commit(page_url.as_deref());
+                drop(st);
+                respond(stream, cors, json_res(409, json!({ "error": "manual_edit_preflight_failed", "message": message })));
+                return;
+            }
+            transaction = match manual_apply::write_manual_apply_transaction(cwd, env, &page_url_val, &transaction_batch) {
+                Ok(tx) => Some(tx),
+                Err(message) => {
+                    let mut st = lock(shared);
+                    st.end_commit(page_url.as_deref());
+                    let mut details = Map::new();
+                    details.insert("message".into(), json!(message));
+                    st.record_manual_edit_activity("manual_edit_transaction_create_failed", details);
+                    drop(st);
+                    respond(stream, cors, json_res(409, json!({ "error": "manual_edit_transaction_create_failed", "message": message })));
+                    return;
+                }
+            };
+        } else if repair_only && existing_transaction.is_some() {
+            transaction = existing_transaction.clone();
+        }
+        Some(transaction_batch)
+    };
     ticket.release();
     if async_mode {
         respond(
@@ -2467,28 +2543,6 @@ fn handle_manual_edit_commit(
                 json!({ "status": "started", "pendingCount": pending_count, "totalCount": before_total, "perPage": before_per_page }),
             ),
         );
-    }
-    // The commit itself.
-    let mut routed_provider = "subprocess";
-    let mut transaction: Option<Value> = None;
-    let mut commit_batch: Option<Value> = None;
-    if pending_count > 0 {
-        let transaction_batch = crate::manual_edits::evidence::build_manual_edit_evidence(
-            cwd,
-            env,
-            page_url.as_deref(),
-        );
-        if !repair_only && manual_apply::count_manual_apply_ops(&transaction_batch) > 0 {
-            transaction = Some(manual_apply::write_manual_apply_transaction(
-                cwd,
-                env,
-                &page_url_val,
-                &transaction_batch,
-            ));
-        } else if repair_only && existing_transaction.is_some() {
-            transaction = existing_transaction.clone();
-        }
-        commit_batch = Some(transaction_batch);
     }
     let requested_mode = env
         .get("IMPECCABLE_LIVE_COPY_AGENT")
@@ -2561,7 +2615,7 @@ fn handle_manual_edit_commit(
             },
         )
     };
-    let result = match result {
+    let mut result = match result {
         Ok(r) => r,
         Err(message) => {
             let mut st = lock(shared);
@@ -2587,14 +2641,8 @@ fn handle_manual_edit_commit(
             );
             st.record_manual_edit_activity("manual_edit_commit_failed", details);
             st.end_commit(page_url.as_deref());
-            // finally: clear transaction (result undefined -> not kept)
-            if let Some(t) = &transaction {
-                manual_apply::clear_manual_apply_transaction(
-                    cwd,
-                    env,
-                    t.get("id").and_then(|v| v.as_str()),
-                );
-            }
+            // Preserve the transaction after any uncertain failure. Its
+            // before-image and the current source are needed for recovery.
             drop(st);
             if !async_mode {
                 respond(
@@ -2611,12 +2659,15 @@ fn handle_manual_edit_commit(
     };
     if let Some(t) = &transaction {
         let keep = result.get("needsManualDecision") == Some(&Value::Bool(true));
-        if !keep {
-            manual_apply::clear_manual_apply_transaction(
-                cwd,
-                env,
-                t.get("id").and_then(|v| v.as_str()),
-            );
+        if !keep && !manual_apply::clear_manual_apply_transaction(
+            cwd,
+            env,
+            t.get("id").and_then(|v| v.as_str()),
+        ) {
+            if let Some(result) = result.as_object_mut() {
+                result.insert("needsManualDecision".into(), json!(true));
+                result.insert("transactionCleanupError".into(), json!("manual_edit_transaction_clear_failed"));
+            }
         }
     }
     let (total, per_page) = manual_buffer::count_by_page(cwd, env);

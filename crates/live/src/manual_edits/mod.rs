@@ -10,6 +10,12 @@ pub mod buffer;
 pub mod commit;
 pub mod evidence;
 
+#[cfg(test)]
+mod legacy_revision_candidate;
+
+#[cfg(test)]
+mod rollback_tests;
+
 use crate::util::jsp;
 use once_cell::sync::Lazy;
 use regex::Regex;

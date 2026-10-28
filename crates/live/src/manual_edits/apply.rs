@@ -9,7 +9,7 @@ use crate::server_state::{
     lock, now_i64, truthy, ApplyDeferred, FileSnapshot, Shared, TimedOutApply,
 };
 use crate::util::{
-    exists, iso_now, json_pretty, jsp, read_dir_names_raw, read_json, safe_read, Env,
+    exists, iso_now, json_pretty, jsp, read_dir_names_raw, read_json, Env,
 };
 use serde_json::{json, Map, Value};
 use std::sync::mpsc::channel;
@@ -1118,42 +1118,54 @@ pub fn snapshot_apply_event_files(batch: &Value, cwd: &str) -> Vec<(String, File
 /// JS: rollbackApplySnapshot(batch, rollbackSnapshot, extraFiles, reason, cwd)
 pub fn rollback_apply_snapshot(
     batch: &Value,
-    snapshot: &[(String, FileSnapshot)],
+    _snapshot: &[(String, FileSnapshot)],
     extra_files: &[Value],
     cwd: &str,
 ) -> Value {
+    // A source file may have been changed by an editor after the agent was
+    // dispatched. A comparison followed by a write still has a race, so no
+    // uncoordinated automatic restoration is safe here.
     let scope = collect_manual_apply_files(batch, extra_files, cwd);
-    let mut rolled: Vec<String> = Vec::new();
-    let mut failures: Vec<Value> = Vec::new();
-    for rel in scope {
-        let Some((_, before)) = snapshot.iter().find(|(k, _)| *k == rel) else {
-            continue;
-        };
-        let abs = jsp::resolve(cwd, &[&rel]);
-        let res: Result<(), String> = (|| {
-            if before.exists {
-                if let Some(parent) = std::path::Path::new(&abs).parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                std::fs::write(&abs, &before.content).map_err(|e| e.to_string())?;
-            } else if exists(&abs) {
-                std::fs::remove_file(&abs).map_err(|e| e.to_string())?;
-            }
-            Ok(())
-        })();
-        match res {
-            Ok(()) => rolled.push(rel),
-            Err(e) => {
-                failures.push(json!({ "file": rel, "reason": "restore_failed", "message": e }))
-            }
-        }
-    }
-    json!({ "rolledBackFiles": rolled, "rollbackFailures": failures })
+    let failures: Vec<Value> = scope.iter().map(|file| json!({
+        "file": file, "reason": "manual_recovery_required"
+    })).collect();
+    json!({ "rolledBackFiles": [], "rollbackFailures": failures,
+            "recoveryRequired": !scope.is_empty() })
 }
 
 /// JS: manualApplyTransactionPath(cwd)
 pub fn manual_apply_transaction_path(cwd: &str, env: &Env) -> String {
     jsp::join(&[&live_dir(cwd, env), "manual-edit-apply-transaction.json"])
+}
+
+// All cooperating transaction creators and clearers share a permanent
+// kernel lock file. It is never unlinked; the OS releases the lock on exit.
+fn lock_transaction(cwd: &str, env: &Env) -> Result<std::fs::File, String> {
+    let file = manual_apply_transaction_path(cwd, env);
+    let parent = std::path::Path::new(&file).parent().ok_or("manual_edit_transaction_invalid_path")?;
+    let locks = parent.join("locks");
+    std::fs::create_dir_all(&locks).map_err(|e| format!("manual_edit_transaction_lock_failed: {e}"))?;
+    let lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+        .open(locks.join("manual-edit-apply-transaction.lock"))
+        .map_err(|e| format!("manual_edit_transaction_lock_failed: {e}"))?;
+    lock.lock().map_err(|e| format!("manual_edit_transaction_lock_failed: {e}"))?;
+    Ok(lock)
+}
+
+/// Execute a cooperating buffer mutation only while no Apply transaction
+/// exists. Lock order is transaction first, then buffer inside the closure.
+/// The closure must not acquire the transaction lock again.
+pub fn with_no_active_transaction<T>(
+    cwd: &str,
+    env: &Env,
+    mutate: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let _guard = lock_transaction(cwd, env)?;
+    match std::fs::metadata(manual_apply_transaction_path(cwd, env)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => mutate(),
+        Ok(_) => Err("manual_edit_apply_in_flight".into()),
+        Err(e) => Err(format!("manual_edit_transaction_unreadable: {e}")),
+    }
 }
 
 /// JS: readManualApplyTransaction(cwd)
@@ -1171,21 +1183,26 @@ pub fn write_manual_apply_transaction(
     env: &Env,
     page_url: &Value,
     batch: &Value,
-) -> Value {
+) -> Result<Value, String> {
+    use std::io::Write;
+    let _guard = lock_transaction(cwd, env)?;
     let file = manual_apply_transaction_path(cwd, env);
-    let files = collect_manual_apply_files(batch, &[], cwd);
-    let file_entries: Vec<Value> = files
-        .iter()
-        .map(|rel| {
-            let abs = jsp::resolve(cwd, &[rel]);
-            let ex = exists(&abs);
-            json!({
-                "file": rel,
-                "exists": ex,
-                "content": if ex { safe_read(&abs).unwrap_or_default() } else { String::new() },
-            })
-        })
-        .collect();
+    match std::fs::metadata(&file) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => return Err("manual_edit_recovery_required".into()),
+        Err(e) => return Err(format!("manual_edit_transaction_unreadable: {e}")),
+    }
+    let mut file_entries = Vec::new();
+    for rel in collect_manual_apply_files(batch, &[], cwd) {
+        let abs = jsp::resolve(cwd, &[&rel]);
+        let (ex, content) = match std::fs::read(&abs) {
+            Ok(bytes) => (true, String::from_utf8(bytes)
+                .map_err(|e| format!("manual_edit_snapshot_unreadable: {rel}: {e}"))?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, String::new()),
+            Err(e) => return Err(format!("manual_edit_snapshot_unreadable: {rel}: {e}")),
+        };
+        file_entries.push(json!({ "file": rel, "exists": ex, "content": content }));
+    }
     let transaction = json!({
         "version": 1,
         "id": random_id8(),
@@ -1194,35 +1211,40 @@ pub fn write_manual_apply_transaction(
         "entryIds": entries_of(batch).iter().filter_map(|e| e.get("id")).filter(|v| truthy(Some(v))).cloned().collect::<Vec<_>>(),
         "files": file_entries,
     });
-    if let Some(parent) = std::path::Path::new(&file).parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let tmp = format!("{}.tmp", file);
-    let _ = std::fs::write(&tmp, format!("{}\n", json_pretty(&transaction)));
-    let _ = std::fs::rename(&tmp, &file);
-    transaction
+    let parent = std::path::Path::new(&file).parent().ok_or("manual_edit_transaction_invalid_path")?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("manual_edit_transaction_write_failed: {e}"))?;
+    // Publish a complete record without ever replacing an unresolved record.
+    // Both paths are siblings on the same filesystem. A failed hard link is
+    // an error, not permission to run the agent without a durable record.
+    let tmp = format!("{}.{}.tmp", file, random_id8());
+    // Do not clean up a path we failed to create: another process may own it.
+    let mut handle = std::fs::OpenOptions::new().write(true).create_new(true)
+        .open(&tmp).map_err(|e| format!("manual_edit_transaction_write_failed: {e}"))?;
+    let staged = handle.write_all(format!("{}\n", json_pretty(&transaction)).as_bytes())
+        .and_then(|_| handle.sync_all());
+    drop(handle);
+    let result = staged.map_err(|e| format!("manual_edit_transaction_write_failed: {e}"))
+        .and_then(|_| std::fs::hard_link(&tmp, &file)
+            .map_err(|e| format!("manual_edit_transaction_write_failed: {e}")));
+    let _ = std::fs::remove_file(&tmp);
+    result?;
+    Ok(transaction)
 }
 
 /// JS: clearManualApplyTransaction(cwd, transactionId)
 pub fn clear_manual_apply_transaction(cwd: &str, env: &Env, transaction_id: Option<&str>) -> bool {
-    let file = manual_apply_transaction_path(cwd, env);
-    if !exists(&file) {
+    let Some(tid) = transaction_id.filter(|s| !s.is_empty()) else { return false; };
+    // An absent record needs no mutation or lock; if another process creates
+    // one after this check, returning false still leaves its record untouched.
+    if std::fs::metadata(manual_apply_transaction_path(cwd, env)).is_err() {
         return false;
     }
-    if let Some(tid) = transaction_id.filter(|s| !s.is_empty()) {
-        if let Some(existing) = read_manual_apply_transaction(cwd, env) {
-            if let Some(id) = existing
-                .get("id")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-            {
-                if id != tid {
-                    return false;
-                }
-            }
-        }
+    let Ok(_guard) = lock_transaction(cwd, env) else { return false; };
+    let Some(existing) = read_manual_apply_transaction(cwd, env) else { return false; };
+    if existing.get("id").and_then(Value::as_str) != Some(tid) {
+        return false;
     }
-    std::fs::remove_file(&file).is_ok()
+    std::fs::remove_file(manual_apply_transaction_path(cwd, env)).is_ok()
 }
 
 /// JS: rollbackManualApplyTransaction({ cwd, pageUrl, reason,
@@ -1231,99 +1253,54 @@ pub fn clear_manual_apply_transaction(cwd: &str, env: &Env, transaction_id: Opti
 pub fn rollback_manual_apply_transaction(
     cwd: &str,
     env: &Env,
-    page_url: Option<&str>,
+    _page_url: Option<&str>,
     reason: &str,
 ) -> (Option<Value>, Option<Map<String, Value>>) {
-    let Some(transaction) = read_manual_apply_transaction(cwd, env) else {
-        return (None, None);
+    let file = manual_apply_transaction_path(cwd, env);
+    // Startup recovery is a read-only no-op when no record exists. The
+    // record is checked again under lock before any further handling.
+    match std::fs::metadata(&file) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (None, None),
+        Err(e) => return (Some(json!({
+            "reason": reason, "rolledBackFiles": [],
+            "rollbackFailures": [{ "reason": "manual_edit_transaction_unreadable", "message": e.to_string() }],
+            "recoveryRequired": true
+        })), None),
+        Ok(_) => {}
+    }
+    let _guard = match lock_transaction(cwd, env) {
+        Ok(guard) => guard,
+        Err(message) => return (Some(json!({
+            "reason": reason, "rolledBackFiles": [],
+            "rollbackFailures": [{ "reason": "manual_edit_transaction_lock_failed", "message": message }],
+            "recoveryRequired": true
+        })), None),
     };
-    if let Some(pu) = page_url {
-        if let Some(tp) = transaction.get("pageUrl").filter(|v| truthy(Some(v))) {
-            if tp.as_str() != Some(pu) {
-                return (None, None);
-            }
-        }
+    match std::fs::metadata(&file) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (None, None),
+        Err(e) => return (Some(json!({
+            "reason": reason, "rolledBackFiles": [],
+            "rollbackFailures": [{ "reason": "manual_edit_transaction_unreadable", "message": e.to_string() }],
+            "recoveryRequired": true
+        })), None),
+        Ok(_) => {}
     }
-    let tid = transaction.get("id").cloned().unwrap_or(Value::Null);
-    let tid_str = tid.as_str().map(String::from);
-    let entry_ids: Vec<Value> = arr(transaction.get("entryIds")).to_vec();
-    let buffer = crate::manual_edits::buffer::read_buffer(cwd, env);
-    let pending_ids: Vec<Value> = buffer
-        .entries
-        .iter()
-        .filter_map(|e| e.get("id"))
-        .filter(|v| truthy(Some(v)))
-        .cloned()
-        .collect();
-    let should_rollback = entry_ids.iter().any(|id| pending_ids.contains(id));
-    if !should_rollback {
-        clear_manual_apply_transaction(cwd, env, tid_str.as_deref());
-        return (
-            Some(
-                json!({ "id": tid, "reason": reason, "rolledBackFiles": [], "rollbackFailures": [], "skipped": "entries_not_pending" }),
-            ),
-            None,
-        );
+    // Neither an agent reply nor a before-image proves ownership of current
+    // source bytes. Preserve both the source and the on-disk transaction for
+    // explicit recovery; never replace or remove concurrently edited files.
+    let tx = read_manual_apply_transaction(cwd, env);
+    let tid = tx.as_ref().and_then(|v| v.get("id")).cloned().unwrap_or(Value::Null);
+    let files = tx.as_ref().and_then(|v| v.get("files")).and_then(Value::as_array);
+    let mut failures: Vec<Value> = files.into_iter().flatten().filter_map(|item|
+        normalize_project_file(item.get("file"), cwd)
+            .map(|file| json!({ "file": file, "reason": "manual_recovery_required" }))
+    ).collect();
+    if failures.is_empty() {
+        failures.push(json!({ "reason": "manual_recovery_required" }));
     }
-    let mut rolled: Vec<String> = Vec::new();
-    let mut failures: Vec<Value> = Vec::new();
-    for item in arr(transaction.get("files")) {
-        let Some(rel) = normalize_project_file(item.get("file"), cwd) else {
-            continue;
-        };
-        let abs = jsp::resolve(cwd, &[&rel]);
-        let res: Result<(), String> = (|| {
-            if truthy(item.get("exists")) {
-                if let Some(parent) = std::path::Path::new(&abs).parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let content = item.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                std::fs::write(&abs, content).map_err(|e| e.to_string())?;
-            } else if exists(&abs) {
-                std::fs::remove_file(&abs).map_err(|e| e.to_string())?;
-            }
-            Ok(())
-        })();
-        match res {
-            Ok(()) => rolled.push(rel),
-            Err(e) => {
-                failures.push(json!({ "file": rel, "reason": "restore_failed", "message": e }))
-            }
-        }
-    }
-    clear_manual_apply_transaction(cwd, env, tid_str.as_deref());
-    let mut activity = Map::new();
-    activity.insert("id".into(), tid.clone());
-    activity.insert(
-        "pageUrl".into(),
-        match transaction.get("pageUrl") {
-            Some(v) if truthy(Some(v)) => v.clone(),
-            _ => Value::Null,
-        },
-    );
-    activity.insert("reason".into(), json!(reason));
-    activity.insert("entryIds".into(), Value::Array(entry_ids));
-    activity.insert(
-        "rolledBackFiles".into(),
-        Value::Array(
-            rolled
-                .iter()
-                .filter_map(|f| summarize_manual_log_file(Some(&Value::String(f.clone())), cwd))
-                .map(Value::String)
-                .collect(),
-        ),
-    );
-    opt_insert(
-        &mut activity,
-        "rollbackFailures",
-        summarize_manual_diagnostics(Some(&Value::Array(failures.clone())), cwd),
-    );
-    (
-        Some(
-            json!({ "id": tid, "reason": reason, "rolledBackFiles": rolled, "rollbackFailures": failures }),
-        ),
-        Some(activity),
-    )
+    let result = json!({ "id": tid, "reason": reason, "rolledBackFiles": [],
+                         "rollbackFailures": failures, "recoveryRequired": true });
+    (Some(result), None)
 }
 
 // ---------------------------------------------------------------------------
@@ -1352,7 +1329,7 @@ pub fn push_apply_event_and_wait(
     chunk: Option<&Value>,
     repair: Option<&Value>,
 ) -> Result<Value, String> {
-    let (rx, event_id, cwd, env, hard_timeout) = {
+    let (rx, event_id, hard_timeout) = {
         let mut st = lock(shared);
         let cwd = st.cwd.clone();
         let env = st.env.clone();
@@ -1406,7 +1383,7 @@ pub fn push_apply_event_and_wait(
         ));
         st.enqueue_event(event);
         let hard = apply_event_hard_timeout_ms(&env);
-        (rx, event_id, cwd, env, hard)
+        (rx, event_id, hard)
     };
     // Hard timeout timer.
     {
@@ -1415,8 +1392,6 @@ pub fn push_apply_event_and_wait(
         let batch_c = batch.clone();
         let page_url_c = page_url.clone();
         let chunk_c = chunk.cloned().unwrap_or(Value::Null);
-        let cwd_c = cwd.clone();
-        let env_c = env.clone();
         let delay = if hard_timeout.is_finite() && hard_timeout > 0.0 {
             hard_timeout as u64
         } else {
@@ -1446,7 +1421,8 @@ pub fn push_apply_event_and_wait(
                 },
             );
             st.acknowledge_pending_event(Some(&eid), None);
-            remove_manual_apply_evidence(deferred.event.get("evidencePath"), &cwd_c, &env_c);
+            // The agent may have written source before its late reply.
+            // Keep the dispatched evidence for explicit recovery.
             let mut details = Map::new();
             details.insert("id".into(), json!(eid));
             details.insert("pageUrl".into(), page_url_c);
@@ -1665,7 +1641,12 @@ pub fn resolve_deferred(
     };
     let (_, deferred) = st.pending_apply_deferreds.remove(pos);
     let env = st.env.clone();
-    remove_manual_apply_evidence(deferred.event.get("evidencePath"), &deferred.cwd, &env);
+    // Preserve the exact dispatched evidence while a transaction is active:
+    // source verification may still fail after this reply arrives.
+    if matches!(std::fs::metadata(manual_apply_transaction_path(&deferred.cwd, &env)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
+        remove_manual_apply_evidence(deferred.event.get("evidencePath"), &deferred.cwd, &env);
+    }
     let _ = deferred.tx.send(Ok(body));
     true
 }
@@ -1676,6 +1657,12 @@ pub fn prune_stale_evidence(st: &crate::server_state::ServerState) -> Vec<String
     let env = st.env.clone();
     let dir = manual_apply_evidence_dir(&cwd, &env);
     if !exists(&dir) {
+        return vec![];
+    }
+    // An unresolved or unreadable transaction needs its evidence for manual
+    // recovery; do not prune it on restart or while Apply is in progress.
+    if !matches!(std::fs::metadata(manual_apply_transaction_path(&cwd, &env)),
+                 Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
         return vec![];
     }
     let mut referenced: Vec<String> = Vec::new();
@@ -1754,12 +1741,16 @@ pub fn cancel_pending_events(
             continue;
         }
         st.pending_events.remove(i);
-        remove_manual_apply_evidence(ev.get("evidencePath"), &cwd, &env);
         let id = ev
             .get("id")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        // A deferred event may already have been delivered to an agent.
+        // Its evidence is retained when automatic rollback is unsafe.
+        if !st.pending_apply_deferreds.iter().any(|(event_id, _)| event_id == &id) {
+            remove_manual_apply_evidence(ev.get("evidencePath"), &cwd, &env);
+        }
         let rec = json!({
             "id": ev.get("id").cloned().unwrap_or(Value::Null),
             "pageUrl": ev.get("pageUrl").cloned().unwrap_or(Value::Null),
@@ -1798,7 +1789,9 @@ pub fn cancel_pending_events(
                 cwd: deferred.cwd.clone(),
             },
         );
-        remove_manual_apply_evidence(deferred.event.get("evidencePath"), &deferred.cwd, &env);
+        if rollback.get("recoveryRequired") != Some(&Value::Bool(true)) {
+            remove_manual_apply_evidence(deferred.event.get("evidencePath"), &deferred.cwd, &env);
+        }
         let rec = json!({
             "id": eid,
             "pageUrl": deferred.page_url,
@@ -1860,7 +1853,10 @@ pub fn apply_in_flight(st: &crate::server_state::ServerState, page_url: &str) ->
             .and_then(|p| p.as_str())
             .map(|p| p == page_url)
             .unwrap_or(true),
-        None => false,
+        None => match std::fs::metadata(manual_apply_transaction_path(&st.cwd, &st.env)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            _ => true,
+        },
     }
 }
 

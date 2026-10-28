@@ -1,6 +1,31 @@
 //! Filesystem helpers shared by the verb crates.
 
+use std::fmt;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+
+#[derive(Debug)]
+struct AtomicWriteError {
+    operation: &'static str,
+    target: PathBuf,
+    source: io::Error,
+}
+
+impl fmt::Display for AtomicWriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "atomic write {} for {}: {}", self.operation, self.target.display(), self.source)
+    }
+}
+
+impl std::error::Error for AtomicWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn atomic_write_error(operation: &'static str, target: &Path, source: io::Error) -> io::Error {
+    io::Error::new(source.kind(), AtomicWriteError { operation, target: target.to_path_buf(), source })
+}
 
 /// Replace `path` with `bytes` atomically: write a sibling temp file, then
 /// rename it over the target, so a crash or a full disk never leaves a
@@ -28,12 +53,16 @@ pub fn write_atomic(path: impl AsRef<Path>, bytes: &[u8]) -> std::io::Result<()>
         // A dangling link can point into a directory that does not exist yet
         // (a first-time dotfiles checkout); callers only create the link's own
         // parent.
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(&temp, bytes)?;
+        std::fs::create_dir_all(&dir).map_err(|e| atomic_write_error("create_dir", &target, e))?;
+        let mut file = std::fs::File::create(&temp).map_err(|e| atomic_write_error("create_temp", &target, e))?;
+        file.write_all(bytes).map_err(|e| atomic_write_error("write", &target, e))?;
+        file.flush().map_err(|e| atomic_write_error("flush", &target, e))?;
+        // Close the temporary file before replacement, including on Windows.
+        drop(file);
         if let Ok(meta) = std::fs::metadata(&target) {
             let _ = std::fs::set_permissions(&temp, meta.permissions());
         }
-        std::fs::rename(&temp, &target)
+        std::fs::rename(&temp, &target).map_err(|e| atomic_write_error("rename_replace", &target, e))
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temp);
@@ -76,6 +105,24 @@ fn resolve_write_target(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atomic_error_context_preserves_kind_and_source_without_file_contents() {
+        use std::error::Error;
+
+        let target = Path::new("example/pending.json");
+        for operation in ["create_dir", "create_temp", "write", "flush", "rename_replace"] {
+            let error = atomic_write_error(operation, target, io::Error::from_raw_os_error(5));
+            assert_eq!(error.kind(), io::Error::from_raw_os_error(5).kind());
+            let text = error.to_string();
+            assert!(text.contains(operation));
+            assert!(text.contains("example"));
+            assert!(text.contains("pending.json"));
+            let context = error.get_ref().unwrap().downcast_ref::<AtomicWriteError>().unwrap();
+            let original = context.source().unwrap().downcast_ref::<io::Error>().unwrap();
+            assert_eq!(original.raw_os_error(), Some(5));
+        }
+    }
 
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(

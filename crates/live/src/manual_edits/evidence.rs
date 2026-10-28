@@ -2,7 +2,7 @@
 //! edits: staged entries, flattened ops, and likely source candidates.
 
 use crate::event_validation::truthy;
-use crate::manual_edits::buffer::{buffer_path, read_buffer};
+use crate::manual_edits::buffer::{buffer_path, update_buffer};
 use crate::manual_edits::is_generated_file;
 use crate::util::{exists, jsp, Env};
 use once_cell::sync::Lazy;
@@ -187,7 +187,7 @@ pub(crate) fn is_path_inside_or_equal(cwd: &str, file: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// JS: buildManualEditEvidence({ cwd, pageUrl })
-pub fn build_manual_edit_evidence(cwd: &str, env: &Env, page_url: Option<&str>) -> Value {
+pub fn build_manual_edit_evidence(cwd: &str, env: &Env, page_url: Option<&str>) -> Result<Value, String> {
     let pu = match page_url {
         Some(s) => Value::String(s.to_string()),
         None => Value::Null,
@@ -197,8 +197,8 @@ pub fn build_manual_edit_evidence(cwd: &str, env: &Env, page_url: Option<&str>) 
 
 /// The same, but with the raw JS value for `pageUrl` (the CLI's bare
 /// `--page-url` flag yields the boolean `true`).
-pub fn build_manual_edit_evidence_value(cwd: &str, env: &Env, page_url: &Value) -> Value {
-    let buffer = read_buffer(cwd, env);
+pub fn build_manual_edit_evidence_value(cwd: &str, env: &Env, page_url: &Value) -> Result<Value, String> {
+    let buffer = update_buffer(cwd, env, |buffer| Ok(buffer.clone()))?;
     let entries: Vec<Value> = if truthy(Some(page_url)) {
         buffer
             .entries
@@ -218,7 +218,7 @@ pub fn build_manual_edit_evidence_value(cwd: &str, env: &Env, page_url: &Value) 
         m.insert("entries".into(), json!([]));
         m.insert("ops".into(), json!([]));
         m.insert("candidates".into(), json!([]));
-        return Value::Object(m);
+        return Ok(Value::Object(m));
     }
 
     let search_files = collect_search_files(cwd);
@@ -245,7 +245,7 @@ pub fn build_manual_edit_evidence_value(cwd: &str, env: &Env, page_url: &Value) 
     m.insert("ops".into(), Value::Array(ops));
     m.insert("context".into(), Value::Object(ctx));
     m.insert("candidates".into(), Value::Array(candidates));
-    Value::Object(m)
+    Ok(Value::Object(m))
 }
 
 pub(crate) fn count_ops(entries: &[Value]) -> usize {
@@ -836,4 +836,48 @@ fn find_context_matches(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod strict_evidence_tests {
+    use super::*;
+    use crate::manual_edits::buffer::{buffer_path, stage_entry};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn fixture(label: &str) -> (String, Env) {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("impeccable-evidence-{label}-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        (dir.to_string_lossy().into_owned(), Env::new())
+    }
+    #[test]
+    fn frozen_evidence_preserves_staged_revision_and_empty_buffer_is_valid() {
+        let (cwd, env) = fixture("valid");
+        assert_eq!(build_manual_edit_evidence(&cwd, &env, Some("/")).unwrap()["count"], 0);
+        let staged = stage_entry(&cwd, &env, &json!({"id":"e1","pageUrl":"/","element":{},"ops":[{"ref":"main>p","tag":"p","originalText":"A","newText":"B"}]})).unwrap();
+        let evidence = build_manual_edit_evidence(&cwd, &env, Some("/")).unwrap();
+        assert_eq!(evidence["count"], 1);
+        assert_eq!(evidence["entries"][0]["ops"][0]["_impeccableRevision"], staged.entries[0]["ops"][0]["_impeccableRevision"]);
+        assert!(evidence["entries"][0]["ops"][0]["_impeccableRevision"].as_str().is_some());
+    }
+    #[test]
+    fn malformed_or_invalid_utf8_buffer_returns_error_and_preserves_bytes() {
+        for damaged in [b"{broken".as_slice(), b"{\"version\":1,\"entries\":[\xff]}".as_slice()] {
+            let (cwd, env) = fixture("corrupt");
+            stage_entry(&cwd, &env, &json!({"id":"e1","pageUrl":"/","element":{},"ops":[{"ref":"main>p","newText":"B"}]})).unwrap();
+            let path = buffer_path(&cwd, &env);
+            std::fs::write(&path, damaged).unwrap();
+            assert!(build_manual_edit_evidence(&cwd, &env, Some("/")).is_err());
+            assert!(build_manual_edit_evidence_value(&cwd, &env, &json!("/")).is_err());
+            assert_eq!(std::fs::read(path).unwrap(), damaged);
+        }
+    }
+    #[test]
+    fn unreadable_buffer_path_returns_error_not_empty_evidence() {
+        let (cwd, env) = fixture("unreadable");
+        let path = buffer_path(&cwd, &env);
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(build_manual_edit_evidence(&cwd, &env, Some("/")).is_err());
+        assert!(std::path::Path::new(&path).is_dir());
+    }
 }
