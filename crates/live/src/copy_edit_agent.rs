@@ -120,9 +120,24 @@ pub fn run_copy_edit_batch_agent(
     apply_batch_to_source: Option<&mut dyn FnMut(&Value, Option<&Value>) -> Result<Value, String>>,
     chat_available: Option<&dyn Fn() -> bool>,
 ) -> Result<Value, String> {
+    let mut ignored = false;
+    run_copy_edit_batch_agent_tracked(batch, cwd, env, provider, timeout_ms, apply_batch_to_source, chat_available, &mut ignored)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_copy_edit_batch_agent_tracked(
+    batch: &Value,
+    cwd: &str,
+    env: &Env,
+    provider: Option<&str>,
+    timeout_ms: Option<f64>,
+    apply_batch_to_source: Option<&mut dyn FnMut(&Value, Option<&Value>) -> Result<Value, String>>,
+    chat_available: Option<&dyn Fn() -> bool>,
+    dispatch_started: &mut bool,
+) -> Result<Value, String> {
     let provider: Option<String> = match provider {
         Some(p) if !p.is_empty() => Some(p.to_string()),
-        _ => choose_copy_edit_agent(env, chat_available),
+        _ => choose_copy_edit_agent_tracked(env, chat_available, dispatch_started),
     };
     let provider = provider.unwrap_or_default();
     if provider == "mock" {
@@ -130,6 +145,7 @@ pub fn run_copy_edit_batch_agent(
         if delay_ms > 0.0 {
             std::thread::sleep(std::time::Duration::from_millis(delay_ms as u64));
         }
+        *dispatch_started = true;
         return mock_batch_result(batch, env, cwd);
     }
     if provider == "chat" {
@@ -140,6 +156,7 @@ pub fn run_copy_edit_batch_agent(
             Some(v) if truthy(Some(v)) => Some(v.clone()),
             _ => None,
         };
+        *dispatch_started = true;
         let raw = cb(batch, repair.as_ref())?;
         let raw = if truthy(Some(&raw)) { raw } else { json!({}) };
         return Ok(normalize_batch_result(&raw));
@@ -151,6 +168,9 @@ pub fn run_copy_edit_batch_agent(
         ));
     }
 
+    if provider != "codex" && provider != "claude" {
+        return Err(format!("Unsupported live copy-edit AI runner: {}", provider));
+    }
     let prompt = build_copy_edit_batch_prompt(batch, cwd);
     let out_dir = mkdtemp("impeccable-copy-batch-")?;
     let _ = std::fs::create_dir_all(&out_dir);
@@ -158,9 +178,9 @@ pub fn run_copy_edit_batch_agent(
     let log_path = jsp::join(&[&out_dir, "agent.log"]);
 
     if provider == "codex" {
-        run_codex(&prompt, cwd, env, &result_path, &log_path, timeout_ms)?;
+        run_codex(&prompt, cwd, env, &result_path, &log_path, timeout_ms, dispatch_started)?;
     } else if provider == "claude" {
-        run_claude(&prompt, cwd, env, &result_path, &log_path, timeout_ms)?;
+        run_claude(&prompt, cwd, env, &result_path, &log_path, timeout_ms, dispatch_started)?;
     } else {
         return Err(format!(
             "Unsupported live copy-edit AI runner: {}",
@@ -1274,6 +1294,15 @@ pub fn choose_copy_edit_agent(
     env: &Env,
     chat_available: Option<&dyn Fn() -> bool>,
 ) -> Option<String> {
+    let mut ignored = false;
+    choose_copy_edit_agent_tracked(env, chat_available, &mut ignored)
+}
+
+fn choose_copy_edit_agent_tracked(
+    env: &Env,
+    chat_available: Option<&dyn Fn() -> bool>,
+    dispatch_started: &mut bool,
+) -> Option<String> {
     let raw = env
         .get("IMPECCABLE_LIVE_COPY_AGENT")
         .cloned()
@@ -1309,10 +1338,10 @@ pub fn choose_copy_edit_agent(
             }
         }
         "auto" => {
-            if command_authed("codex") {
+            if command_authed("codex", dispatch_started) {
                 return Some("codex".to_string());
             }
-            if command_authed("claude") {
+            if command_authed("claude", dispatch_started) {
                 return Some("claude".to_string());
             }
             if chat() {
@@ -1335,23 +1364,28 @@ fn command_exists(command: &str) -> bool {
         .unwrap_or(false)
 }
 
-static COMMAND_AUTH_CACHE: Lazy<Mutex<std::collections::HashMap<String, bool>>> =
+// Cache both the result and whether the probe may have started a model.
+// An earlier Claude ping can leave uncertain descendants after timeout.
+static COMMAND_AUTH_CACHE: Lazy<Mutex<std::collections::HashMap<String, (bool, bool)>>> =
     Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
-fn command_authed(command: &str) -> bool {
+fn command_authed(command: &str, dispatch_started: &mut bool) -> bool {
     if let Ok(cache) = COMMAND_AUTH_CACHE.lock() {
-        if let Some(v) = cache.get(command) {
-            return *v;
+        if let Some((ok, may_have_dispatched)) = cache.get(command) {
+            *dispatch_started |= *may_have_dispatched;
+            return *ok;
         }
     }
-    let ok = compute_command_authed(command);
+    let mut probe_started = false;
+    let ok = compute_command_authed(command, &mut probe_started);
+    *dispatch_started |= probe_started;
     if let Ok(mut cache) = COMMAND_AUTH_CACHE.lock() {
-        cache.insert(command.to_string(), ok);
+        cache.insert(command.to_string(), (ok, probe_started));
     }
     ok
 }
 
-fn compute_command_authed(command: &str) -> bool {
+fn compute_command_authed(command: &str, dispatch_started: &mut bool) -> bool {
     if !command_exists(command) {
         return false;
     }
@@ -1361,6 +1395,10 @@ fn compute_command_authed(command: &str) -> bool {
     if command != "claude" {
         return false;
     }
+    // The auth ping is itself an agent process, not a pure availability
+    // check. Mark it before spawn and restore only if spawn fails.
+    let previously_started = *dispatch_started;
+    *dispatch_started = true;
     let child = Command::new("claude")
         .args(["--print", "--output-format", "json", "ping"])
         .stdin(Stdio::null())
@@ -1368,6 +1406,7 @@ fn compute_command_authed(command: &str) -> bool {
         .stderr(Stdio::piped())
         .spawn();
     let Ok(mut child) = child else {
+        *dispatch_started = previously_started;
         return false;
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(10_000);
@@ -1512,6 +1551,7 @@ fn run_codex(
     result_path: &str,
     log_path: &str,
     timeout_ms: Option<f64>,
+    dispatch_started: &mut bool,
 ) -> Result<(), String> {
     let effort = match env.get("IMPECCABLE_LIVE_COPY_AGENT_EFFORT") {
         Some(v) if !v.is_empty() => v.clone(),
@@ -1535,7 +1575,7 @@ fn run_codex(
         }
     }
     args.push("-".into());
-    run_agent_process("codex", &args, prompt, cwd, env, log_path, timeout_ms, None)
+    run_agent_process("codex", &args, prompt, cwd, env, log_path, timeout_ms, None, dispatch_started)
 }
 
 fn run_claude(
@@ -1545,6 +1585,7 @@ fn run_claude(
     result_path: &str,
     log_path: &str,
     timeout_ms: Option<f64>,
+    dispatch_started: &mut bool,
 ) -> Result<(), String> {
     let mut args: Vec<String> = vec![
         "--print".into(),
@@ -1568,6 +1609,7 @@ fn run_claude(
         log_path,
         timeout_ms,
         Some(result_path),
+        dispatch_started,
     )
 }
 
@@ -1581,6 +1623,7 @@ fn run_agent_process(
     log_path: &str,
     timeout_ms: Option<f64>,
     mirror_output_path: Option<&str>,
+    dispatch_started: &mut bool,
 ) -> Result<(), String> {
     let timeout_ms = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
     let mut cmd = Command::new(command);
@@ -1591,9 +1634,14 @@ fn run_agent_process(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    let previously_started = *dispatch_started;
+    *dispatch_started = true;
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return Err(e.to_string()),
+        Err(e) => {
+            *dispatch_started = previously_started;
+            return Err(e.to_string());
+        }
     };
 
     let log = std::sync::Arc::new(Mutex::new(
@@ -1702,4 +1750,32 @@ fn run_agent_process(
             .unwrap_or_else(|| "null".to_string()),
     };
     Err(format!("{} exited with {}", command, what))
+}
+
+#[cfg(test)]
+mod dispatch_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn missing_chat_callback_and_unsupported_provider_never_dispatch() {
+        let env = Env::new();
+        for provider in ["chat", "not-a-provider"] {
+            let mut started = false;
+            let result = run_copy_edit_batch_agent_tracked(&json!({"entries":[]}), ".", &env, Some(provider), None, None, None, &mut started);
+            assert!(result.is_err());
+            assert!(!started);
+        }
+    }
+
+    #[test]
+    fn chat_callback_and_mock_are_marked_before_side_effect_boundary() {
+        let env = Env::new();
+        let mut started = false;
+        let mut cb = |_: &Value, _: Option<&Value>| -> Result<Value, String> { Err("callback failed".into()) };
+        assert!(run_copy_edit_batch_agent_tracked(&json!({"entries":[]}), ".", &env, Some("chat"), None, Some(&mut cb), None, &mut started).is_err());
+        assert!(started);
+        let mut mock_started = false;
+        let _ = run_copy_edit_batch_agent_tracked(&json!({"entries":[]}), ".", &env, Some("mock"), None, None, None, &mut mock_started);
+        assert!(mock_started);
+    }
 }

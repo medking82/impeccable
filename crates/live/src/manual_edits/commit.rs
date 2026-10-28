@@ -2,7 +2,7 @@
 //! AI-owned batch, verifies the reported source changes, and clears only the
 //! entries that verified.
 
-use crate::copy_edit_agent::{run_copy_edit_batch_agent, run_copy_edit_post_apply_checks};
+use crate::copy_edit_agent::{run_copy_edit_batch_agent_tracked, run_copy_edit_post_apply_checks};
 use crate::event_validation::truthy;
 use crate::manual_edits::buffer::{
     count_by_page_value_strict, read_buffer_strict, update_buffer,
@@ -68,6 +68,12 @@ pub fn commit_manual_edits(opts: CommitOptions) -> Result<Value, String> {
 /// The same, with the raw JS value for `pageUrl` (a bare `--page-url` flag
 /// yields the boolean `true`). `opts.page_url` is ignored.
 pub fn commit_manual_edits_value(opts: CommitOptions, page_url: Value) -> Result<Value, String> {
+    commit_manual_edits_value_tracked(opts, page_url).0
+}
+
+/// Returns whether dispatch may have started, alongside the normal result.
+/// Callers may clear their own transaction on an error only when this is false.
+pub(crate) fn commit_manual_edits_value_tracked(opts: CommitOptions, page_url: Value) -> (Result<Value, String>, bool) {
     let cwd = opts.cwd.to_string();
     let env = opts.env.clone();
     let mut agent = Agent {
@@ -77,9 +83,10 @@ pub fn commit_manual_edits_value(opts: CommitOptions, page_url: Value) -> Result
         timeout_ms: opts.timeout_ms,
         apply_batch_to_source: opts.apply_batch_to_source,
         chat_available: opts.chat_available,
+        dispatch_started: false,
     };
     let transaction_id = opts.transaction_id.map(String::from);
-    run_commit(
+    let result = run_commit(
         &cwd,
         &env,
         page_url,
@@ -87,7 +94,13 @@ pub fn commit_manual_edits_value(opts: CommitOptions, page_url: Value) -> Result
         opts.repair_only,
         transaction_id.as_deref(),
         opts.batch,
-    )
+    );
+    (result, agent.dispatch_started)
+}
+
+pub(crate) fn commit_manual_edits_tracked(opts: CommitOptions) -> (Result<Value, String>, bool) {
+    let page_url = opts.page_url.map(|s| Value::String(s.to_string())).unwrap_or(Value::Null);
+    commit_manual_edits_value_tracked(opts, page_url)
 }
 
 struct Agent<'a> {
@@ -98,6 +111,7 @@ struct Agent<'a> {
     apply_batch_to_source:
         Option<&'a mut dyn FnMut(&Value, Option<&Value>) -> Result<Value, String>>,
     chat_available: Option<&'a dyn Fn() -> bool>,
+    dispatch_started: bool,
 }
 
 impl Agent<'_> {
@@ -108,7 +122,7 @@ impl Agent<'_> {
             }
             None => None,
         };
-        run_copy_edit_batch_agent(
+        run_copy_edit_batch_agent_tracked(
             batch,
             &self.cwd,
             &self.env,
@@ -116,6 +130,7 @@ impl Agent<'_> {
             self.timeout_ms,
             cb,
             self.chat_available,
+            &mut self.dispatch_started,
         )
     }
 }
@@ -1910,6 +1925,9 @@ fn run_commit(
     let rollback_snapshot = snapshot_rollback_files(cwd, Some(&base_rollback_scope));
 
     let result = if repair_only {
+        // Repair can mutate state without invoking Agent::run. Never classify
+        // its later errors as safe pre-dispatch transaction cleanup.
+        agent.dispatch_started = true;
         let mut m = Map::new();
         m.insert("status".into(), json!("done"));
         m.insert(

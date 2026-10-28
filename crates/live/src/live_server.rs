@@ -936,12 +936,7 @@ fn handle_connection(shared: Shared, mut stream: TcpStream, mut ticket: Ticket) 
             req.query_get("clientId").map(|s| s.to_string()),
             &mut ticket,
         ),
-        ("/manual-edit-stash", "POST")
-        | ("/manual-edit-stash", "GET")
-        | ("/manual-edit-commit", "POST")
-        | ("/manual-edit-repair-decision", "POST")
-        | ("/manual-edit-discard", "POST")
-        | ("/manual-edit", "POST") => {
+        (path, method) if is_manual_edit_route(path, method) => {
             handle_manual_edit_route(&shared, &mut stream, &cors, &req, &token_now, &mut ticket)
         }
         ("/events", "POST") => handle_events_post(&shared, &mut stream, &cors, &req, &token_now),
@@ -1991,6 +1986,50 @@ fn flag_truthy(v: Option<&str>) -> bool {
     )
 }
 
+fn is_manual_edit_route(path: &str, method: &str) -> bool {
+    matches!((path, method),
+        ("/manual-edit-stash", "POST" | "GET")
+        | ("/manual-edit-recovery", "GET")
+        | ("/manual-edit-commit", "POST")
+        | ("/manual-edit-repair-decision", "POST")
+        | ("/manual-edit-discard", "POST")
+        | ("/manual-edit", "POST"))
+}
+
+// Do not inspect transaction or source files until token authorization passes.
+fn recovery_inspection_response(
+    token_ok: bool,
+    inspect: impl FnOnce() -> Result<Option<Value>, String>,
+) -> Response {
+    if !token_ok { return text_res(401, None, "Unauthorized"); }
+    match inspect() {
+        Ok(Some(report)) => json_res(200, report),
+        Ok(None) => json_res(404, json!({ "error": "manual_edit_recovery_not_found" })),
+        Err(message) => json_res(500, json!({ "error": "manual_edit_recovery_inspection_failed", "message": message })),
+    }
+}
+
+#[cfg(test)]
+mod recovery_route_tests {
+    use super::{is_manual_edit_route, recovery_inspection_response};
+    use serde_json::json;
+
+    #[test]
+    fn recovery_get_routes_and_requires_token_before_inspection() {
+        assert!(is_manual_edit_route("/manual-edit-recovery", "GET"));
+        assert!(!is_manual_edit_route("/manual-edit-recovery", "POST"));
+        assert!(is_manual_edit_route("/manual-edit-stash", "POST"));
+        assert!(is_manual_edit_route("/manual-edit-stash", "GET"));
+        let response = recovery_inspection_response(false, || panic!("unauthorized inspection"));
+        assert_eq!(response.status, 401);
+        let response = recovery_inspection_response(true, || Ok(Some(json!({"writerStatus":"unknown"}))));
+        assert_eq!(response.status, 200);
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["writerStatus"], "unknown");
+        assert_eq!(recovery_inspection_response(true, || Ok(None)).status, 404);
+        assert_eq!(recovery_inspection_response(true, || Err("invalid".into())).status, 500);
+    }
+}
+
 fn handle_manual_edit_route(
     shared: &Shared,
     stream: &mut TcpStream,
@@ -2127,6 +2166,10 @@ fn handle_manual_edit_route(
                     json!({ "count": count, "totalCount": total, "perPage": per_page, "entries": entries }),
                 ),
             );
+        }
+        ("/manual-edit-recovery", "GET") => {
+            let response = recovery_inspection_response(token_ok, || manual_apply::inspect_manual_apply_recovery(&cwd, &env));
+            respond(stream, cors, response);
         }
         ("/manual-edit-commit", "POST") => {
             handle_manual_edit_commit(shared, stream, cors, req, token_ok, &cwd, &env, ticket)
@@ -2387,6 +2430,142 @@ fn handle_manual_edit_route(
     }
 }
 
+// Match the CLI's conservative success contract; a failed, partial, or
+// unknown result must retain the transaction and expose that recovery is needed.
+fn finalize_manual_apply_result(
+    mut result: Value,
+    transaction: &Value,
+    expected_count: usize,
+    dispatch_started: bool,
+    clear: impl FnOnce(Option<&str>) -> bool,
+) -> Value {
+    let id = transaction.get("id").cloned().unwrap_or(Value::Null);
+    let success = crate::live_commit_manual_edits::successful_result(&result, expected_count);
+    let predispatch_failure = !dispatch_started
+        && crate::live_commit_manual_edits::predispatch_failed_without_mutation(&result, expected_count);
+    // Normalize a copy first: unknown shapes or IDs must never authorize clear.
+    let mut released_result = result.clone();
+    let can_release = predispatch_failure && id.as_str().filter(|s| !s.is_empty()).is_some_and(|id| {
+        crate::live_commit_manual_edits::mark_predispatch_transaction_released(&mut released_result, id, expected_count)
+    });
+    let cleanup_failed = (success || can_release)
+        && !id.as_str().filter(|s| !s.is_empty()).is_some_and(|id| clear(Some(id)));
+    if can_release && !cleanup_failed {
+        result = released_result;
+    } else if !success || cleanup_failed {
+        if let Some(object) = result.as_object_mut() {
+            if let Some(previous) = object.get("transactionId").filter(|v| *v != &id).cloned() {
+                object.entry("reportedTransactionId").or_insert(previous);
+            }
+            object.insert("needsManualDecision".into(), json!(true));
+            object.insert("recoveryRequired".into(), json!(true));
+            object.insert("transactionId".into(), id);
+            if cleanup_failed {
+                object.insert("transactionCleanupError".into(), json!("manual_edit_transaction_clear_failed"));
+            }
+        } else {
+            result = json!({ "error": "unrecognized_apply_result", "needsManualDecision": true,
+                             "recoveryRequired": true, "transactionId": id });
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod http_transaction_result_tests {
+    use super::finalize_manual_apply_result;
+    use serde_json::{json, Value};
+
+    fn success() -> Value {
+        json!({"applied":[{"id":"a"}],"failed":[],"files":["a.html"],"count":1,"cleared":1,"pageUrl":"/"})
+    }
+
+    #[test]
+    fn only_definite_success_can_clear_transaction() {
+        let tx = json!({"id":"tx"});
+        let good = finalize_manual_apply_result(success(), &tx, 1, true, |id| id == Some("tx"));
+        assert!(good.get("recoveryRequired").is_none());
+        let mut failed = success();
+        failed["failed"] = json!([{"id":"a"}]);
+        let mut mismatch = success();
+        mismatch["cleared"] = json!(0);
+        let mut conflicts = success();
+        conflicts["conflicts"] = json!([{}]);
+        for result in [failed, mismatch, conflicts, json!({}), Value::Null] {
+            let preserved = finalize_manual_apply_result(result, &tx, 1, true, |_| panic!("unsafe clear"));
+            assert_eq!(preserved["needsManualDecision"], true);
+            assert_eq!(preserved["recoveryRequired"], true);
+            assert_eq!(preserved["transactionId"], "tx");
+        }
+        let cleanup_failed = finalize_manual_apply_result(success(), &tx, 1, true, |_| false);
+        assert_eq!(cleanup_failed["transactionCleanupError"], "manual_edit_transaction_clear_failed");
+        assert_eq!(cleanup_failed["recoveryRequired"], true);
+    }
+
+    #[test]
+    fn known_undispatched_failure_releases_only_matching_transaction() {
+        let tx = json!({"id":"tx"});
+        let failure = json!({"applied":[],"failed":[{"reason":"no provider"}],"files":[],
+            "count":1,"cleared":0,"pageUrl":"/","rolledBackFiles":[],
+            "rollbackFailures":[{"reason":"manual_recovery_required"}],
+            "needsManualDecision":true,"recoveryRequired":true});
+        let released = finalize_manual_apply_result(failure.clone(), &tx, 1, false, |id| id == Some("tx"));
+        assert_eq!(released["transactionReleased"], true);
+        assert_eq!(released["sourceChangeNotDispatched"], true);
+        assert_eq!(released["sourceRollbackNotNeeded"], true);
+        assert_eq!(released["recoveryRequired"], false);
+        assert_eq!(released["needsManualDecision"], true);
+        assert_eq!(released["failed"], failure["failed"]);
+        assert_eq!(released["rollbackFailures"], json!([]));
+        assert_eq!(released["priorRollbackDiagnostics"], failure["rollbackFailures"]);
+        let mut reserved = failure.clone();
+        reserved["priorRollbackDiagnostics"] = json!(["preserve"]);
+        let preserved = finalize_manual_apply_result(reserved.clone(), &tx, 1, false, |_| panic!("unknown shape"));
+        assert_eq!(preserved["recoveryRequired"], true);
+        assert_eq!(preserved["priorRollbackDiagnostics"], reserved["priorRollbackDiagnostics"]);
+        let retained = finalize_manual_apply_result(failure.clone(), &tx, 1, true, |_| panic!("dispatched"));
+        assert_eq!(retained["recoveryRequired"], true);
+        let no_match = finalize_manual_apply_result(failure, &tx, 1, false, |_| false);
+        assert_eq!(no_match["recoveryRequired"], true);
+        assert_eq!(no_match["transactionCleanupError"], "manual_edit_transaction_clear_failed");
+    }
+}
+
+// Only a known pre-dispatch error can release this call's transaction.
+// The real clear callback verifies the transaction ID under its lock.
+fn clear_undispatched_transaction(
+    dispatch_started: bool,
+    transaction_id: Option<&str>,
+    clear: impl FnOnce(&str) -> bool,
+) -> bool {
+    if dispatch_started { return false; }
+    match transaction_id.filter(|id| !id.is_empty()) {
+        Some(id) => clear(id),
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod undispatched_cleanup_tests {
+    use super::clear_undispatched_transaction;
+    use std::cell::Cell;
+
+    #[test]
+    fn only_known_undispatched_matching_transaction_can_clear() {
+        let calls = Cell::new(0);
+        assert!(clear_undispatched_transaction(false, Some("tx"), |id| {
+            calls.set(calls.get() + 1);
+            id == "tx"
+        }));
+        assert_eq!(calls.get(), 1);
+        assert!(!clear_undispatched_transaction(true, Some("tx"), |_| panic!("dispatched")));
+        assert!(!clear_undispatched_transaction(false, None, |_| panic!("missing id")));
+        assert!(!clear_undispatched_transaction(false, Some(""), |_| panic!("empty id")));
+        assert!(!clear_undispatched_transaction(false, Some("other"), |id| id == "tx"));
+        assert!(!clear_undispatched_transaction(false, Some("tx"), |_| false));
+    }
+}
+
 fn handle_manual_edit_commit(
     shared: &Shared,
     stream: &mut TcpStream,
@@ -2406,7 +2585,7 @@ fn handle_manual_edit_commit(
     let async_mode = flag_truthy(req.query_get("async"));
     let repair_only = flag_truthy(req.query_get("repair"));
     let transaction_path = manual_apply::manual_apply_transaction_path(cwd, env);
-    match std::fs::metadata(&transaction_path) {
+    match std::fs::symlink_metadata(&transaction_path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         _ => {
             respond(stream, cors, json_res(409, json!({ "error": "manual_edit_recovery_required" })));
@@ -2573,14 +2752,14 @@ fn handle_manual_edit_commit(
                 .and_then(|v| v.as_str())
                 .map(String::from)
         });
-    let result: Result<Value, String> = if use_chat {
+    let (result, dispatch_started): (Result<Value, String>, bool) = if use_chat {
         routed_provider = "chat";
         let shared_c = shared.clone();
         let page_url_c = page_url_val.clone();
         let mut apply_cb = move |batch: &Value, repair: Option<&Value>| -> Result<Value, String> {
             manual_apply::push_batch_in_chunks_and_wait(&shared_c, batch, &page_url_c, repair)
         };
-        crate::manual_edits::commit::commit_manual_edits(
+        crate::manual_edits::commit::commit_manual_edits_tracked(
             crate::manual_edits::commit::CommitOptions {
                 cwd,
                 env,
@@ -2600,7 +2779,7 @@ fn handle_manual_edit_commit(
         } else {
             None
         };
-        crate::manual_edits::commit::commit_manual_edits(
+        crate::manual_edits::commit::commit_manual_edits_tracked(
             crate::manual_edits::commit::CommitOptions {
                 cwd,
                 env,
@@ -2618,8 +2797,13 @@ fn handle_manual_edit_commit(
     let mut result = match result {
         Ok(r) => r,
         Err(message) => {
+            let cleared = clear_undispatched_transaction(
+                dispatch_started,
+                transaction.as_ref().and_then(|t| t.get("id")).and_then(Value::as_str),
+                |id| manual_apply::clear_manual_apply_transaction(cwd, env, Some(id)),
+            );
             let mut st = lock(shared);
-            if transaction.is_some() {
+            if transaction.is_some() && !cleared {
                 manual_apply::rollback_transaction(
                     &mut st,
                     page_url.as_deref(),
@@ -2631,6 +2815,8 @@ fn handle_manual_edit_commit(
             details.insert("provider".into(), json!(routed_provider));
             details.insert("error".into(), json!("manual_edit_commit_failed"));
             details.insert("message".into(), json!(message));
+            details.insert("dispatchStarted".into(), json!(dispatch_started));
+            details.insert("transactionClearedBeforeDispatch".into(), json!(cleared));
             details.insert(
                 "transactionId".into(),
                 transaction
@@ -2641,8 +2827,8 @@ fn handle_manual_edit_commit(
             );
             st.record_manual_edit_activity("manual_edit_commit_failed", details);
             st.end_commit(page_url.as_deref());
-            // Preserve the transaction after any uncertain failure. Its
-            // before-image and the current source are needed for recovery.
+            // A dispatched or unidentifiable transaction remains available
+            // for recovery; only the caller's proven-undispatched ID clears.
             drop(st);
             if !async_mode {
                 respond(
@@ -2650,7 +2836,10 @@ fn handle_manual_edit_commit(
                     cors,
                     json_res(
                         500,
-                        json!({ "error": "manual_edit_commit_failed", "message": message }),
+                        json!({ "error": "manual_edit_commit_failed", "message": message,
+                                "dispatchStarted": dispatch_started,
+                                "transactionClearedBeforeDispatch": cleared,
+                                "recoveryRequired": transaction.is_some() && !cleared }),
                     ),
                 );
             }
@@ -2658,17 +2847,10 @@ fn handle_manual_edit_commit(
         }
     };
     if let Some(t) = &transaction {
-        let keep = result.get("needsManualDecision") == Some(&Value::Bool(true));
-        if !keep && !manual_apply::clear_manual_apply_transaction(
-            cwd,
-            env,
-            t.get("id").and_then(|v| v.as_str()),
-        ) {
-            if let Some(result) = result.as_object_mut() {
-                result.insert("needsManualDecision".into(), json!(true));
-                result.insert("transactionCleanupError".into(), json!("manual_edit_transaction_clear_failed"));
-            }
-        }
+        let expected_count = commit_batch.as_ref().map(manual_apply::count_manual_apply_ops).unwrap_or(0);
+        result = finalize_manual_apply_result(result, t, expected_count, dispatch_started, |id| {
+            manual_apply::clear_manual_apply_transaction(cwd, env, id)
+        });
     }
     let (total, per_page) = manual_buffer::count_by_page(cwd, env);
     let remaining = match page_url.as_deref() {

@@ -1161,20 +1161,199 @@ pub fn with_no_active_transaction<T>(
     mutate: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
     let _guard = lock_transaction(cwd, env)?;
-    match std::fs::metadata(manual_apply_transaction_path(cwd, env)) {
+    match std::fs::symlink_metadata(manual_apply_transaction_path(cwd, env)) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => mutate(),
         Ok(_) => Err("manual_edit_apply_in_flight".into()),
         Err(e) => Err(format!("manual_edit_transaction_unreadable: {e}")),
     }
 }
 
+// Transaction records must be ordinary files. An unsupported entry remains
+// occupied; it is not evidence that a transaction is absent or recoverable.
+fn trusted_transaction_file_type(is_file: bool, is_symlink: bool) -> bool {
+    is_file && !is_symlink
+}
+
 /// JS: readManualApplyTransaction(cwd)
 pub fn read_manual_apply_transaction(cwd: &str, env: &Env) -> Option<Value> {
     let file = manual_apply_transaction_path(cwd, env);
-    if !exists(&file) {
+    let metadata = std::fs::symlink_metadata(&file).ok()?;
+    if !trusted_transaction_file_type(metadata.is_file(), metadata.file_type().is_symlink()) {
         return None;
     }
     read_json(&file)
+}
+
+// Recovery inspection is deliberately read-only. A transaction contains no
+// trustworthy proof that its original writer has stopped, including after a
+// timeout or restart. A report can guide review, never authorize an unlock.
+fn recovery_relative_path(file: &str) -> Option<std::path::PathBuf> {
+    use std::path::{Component, Path, PathBuf};
+    if file.is_empty() { return None; }
+    let mut result = PathBuf::new();
+    for part in Path::new(file).components() {
+        match part { Component::Normal(name) => result.push(name), _ => return None }
+    }
+    if result.as_os_str().is_empty() { None } else { Some(result) }
+}
+
+fn recovery_hash(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+// Some(None) means a confirmed missing file, None means unknown/unreadable.
+fn recovery_current_source(cwd: &str, relative: &str) -> Option<Option<Vec<u8>>> {
+    let relative = recovery_relative_path(relative)?;
+    let root = std::fs::canonicalize(cwd).ok()?;
+    let candidate = root.join(relative);
+    // Even for a missing target, require the existing parent to resolve within
+    // the project; a symlink or unresolved parent must not expand read scope.
+    let parent = std::fs::canonicalize(candidate.parent()?).ok()?;
+    if !parent.starts_with(&root) { return None; }
+    match std::fs::symlink_metadata(&candidate) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(None),
+        Err(_) => None,
+        Ok(_) => {
+            let resolved = std::fs::canonicalize(&candidate).ok()?;
+            if !resolved.starts_with(&root) || !std::fs::metadata(&resolved).ok()?.is_file() { return None; }
+            std::fs::read(resolved).ok().map(Some)
+        }
+    }
+}
+
+fn build_manual_apply_recovery_report(
+    transaction: &Value,
+    mut current_source: impl FnMut(&str) -> Option<Option<Vec<u8>>>,
+) -> Result<Value, String> {
+    let invalid = || "manual_edit_transaction_invalid_schema".to_string();
+    let id = transaction.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or_else(invalid)?;
+    if transaction.get("version").and_then(Value::as_i64) != Some(1) { return Err(invalid()); }
+    let entries = transaction.get("entryIds").and_then(Value::as_array).ok_or_else(invalid)?;
+    if !entries.iter().all(|entry| entry.as_str().is_some_and(|s| !s.is_empty())) { return Err(invalid()); }
+    let page = match transaction.get("pageUrl") {
+        Some(Value::String(page)) => Value::String(page.clone()),
+        Some(Value::Null) | None => Value::Null,
+        _ => return Err(invalid()),
+    };
+    let files = transaction.get("files").and_then(Value::as_array).ok_or_else(invalid)?;
+    let mut seen = std::collections::HashSet::new();
+    let mut report_files = Vec::new();
+    for file in files {
+        let relative = file.get("file").and_then(Value::as_str).filter(|s| recovery_relative_path(s).is_some()).ok_or_else(invalid)?;
+        if !seen.insert(relative.to_owned()) { return Err(invalid()); }
+        let existed = file.get("exists").and_then(Value::as_bool).ok_or_else(invalid)?;
+        let before = file.get("content").and_then(Value::as_str).ok_or_else(invalid)?.as_bytes();
+        let current = current_source(relative);
+        let status = match &current {
+            None => "unknown",
+            Some(None) if !existed => "unchanged",
+            Some(None) => "missing",
+            Some(Some(bytes)) if existed && bytes == before => "unchanged",
+            Some(Some(_)) => "changed",
+        };
+        let mut item = Map::new();
+        item.insert("file".into(), json!(relative));
+        item.insert("snapshotExists".into(), json!(existed));
+        if existed { item.insert("snapshotSha256".into(), json!(recovery_hash(before))); }
+        item.insert("currentStatus".into(), json!(status));
+        if let Some(Some(bytes)) = current { item.insert("currentSha256".into(), json!(recovery_hash(&bytes))); }
+        report_files.push(Value::Object(item));
+    }
+    Ok(json!({
+        "id": id,
+        "pageUrl": page,
+        "entryIds": entries,
+        "createdAt": transaction.get("createdAt").and_then(Value::as_str),
+        "writerStatus": "unknown",
+        "canRelease": false,
+        "sourceComparisonIsSnapshot": true,
+        "files": report_files,
+    }))
+}
+
+/// Inspect an unresolved transaction without exposing source contents or
+/// changing source, buffer or the transaction record. A missing record is
+/// distinct from an unreadable or malformed one. Caller must authenticate.
+pub fn inspect_manual_apply_recovery(cwd: &str, env: &Env) -> Result<Option<Value>, String> {
+    let file = manual_apply_transaction_path(cwd, env);
+    match std::fs::symlink_metadata(&file) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("manual_edit_transaction_unreadable: {e}")),
+        Ok(meta) if !trusted_transaction_file_type(meta.is_file(), meta.file_type().is_symlink()) => return Err("manual_edit_transaction_unsupported_file_type".into()),
+        Ok(_) => {}
+    }
+    let _guard = lock_transaction(cwd, env)?;
+    match std::fs::symlink_metadata(&file) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("manual_edit_transaction_unreadable: {e}")),
+        Ok(meta) if !trusted_transaction_file_type(meta.is_file(), meta.file_type().is_symlink()) => return Err("manual_edit_transaction_unsupported_file_type".into()),
+        Ok(_) => {}
+    }
+    let bytes = std::fs::read(&file).map_err(|e| format!("manual_edit_transaction_unreadable: {e}"))?;
+    let tx: Value = serde_json::from_slice(&bytes).map_err(|_| "manual_edit_transaction_invalid_json".to_string())?;
+    build_manual_apply_recovery_report(&tx, |relative| recovery_current_source(cwd, relative)).map(Some)
+}
+
+#[cfg(test)]
+mod recovery_inspection_tests {
+    use super::*;
+
+    fn transaction() -> Value {
+        json!({"version":1,"id":"txn","pageUrl":"/","entryIds":["entry"],"createdAt":"now",
+            "files":[{"file":"src/a.txt","exists":true,"content":"sensitive original"},
+                     {"file":"src/b.txt","exists":false,"content":""}]})
+    }
+
+    #[test]
+    fn report_has_hashes_but_not_contents_and_never_claims_writer_stopped() {
+        let report = build_manual_apply_recovery_report(&transaction(), |path| match path {
+            "src/a.txt" => Some(Some(b"sensitive original".to_vec())),
+            "src/b.txt" => Some(None),
+            _ => None,
+        }).unwrap();
+        assert_eq!(report["writerStatus"], "unknown");
+        assert_eq!(report["canRelease"], false);
+        assert_eq!(report["files"][0]["currentStatus"], "unchanged");
+        assert_eq!(report["files"][1]["currentStatus"], "unchanged");
+        assert!(!report.to_string().contains("sensitive original"));
+        assert_eq!(report["files"][0]["snapshotSha256"], report["files"][0]["currentSha256"]);
+    }
+
+    #[test]
+    fn report_distinguishes_drift_missing_and_unknown() {
+        let tx = transaction();
+        let changed = build_manual_apply_recovery_report(&tx, |p| if p.ends_with("a.txt") { Some(Some(b"new".to_vec())) } else { None }).unwrap();
+        assert_eq!(changed["files"][0]["currentStatus"], "changed");
+        assert_eq!(changed["files"][1]["currentStatus"], "unknown");
+        let missing = build_manual_apply_recovery_report(&tx, |_| Some(None)).unwrap();
+        assert_eq!(missing["files"][0]["currentStatus"], "missing");
+    }
+
+    #[test]
+    fn only_ordinary_transaction_files_are_trusted() {
+        assert!(trusted_transaction_file_type(true, false));
+        assert!(!trusted_transaction_file_type(false, true));
+        assert!(!trusted_transaction_file_type(true, true));
+        assert!(!trusted_transaction_file_type(false, false));
+    }
+
+    #[test]
+    fn invalid_transactions_and_nonrelative_paths_are_refused() {
+        let mut tx = transaction();
+        tx["id"] = json!("");
+        assert!(build_manual_apply_recovery_report(&tx, |_| None).is_err());
+        for path in ["../outside", "/absolute", "", "src/../../outside"] {
+            let mut tx = transaction(); tx["files"][0]["file"] = json!(path);
+            assert!(build_manual_apply_recovery_report(&tx, |_| None).is_err());
+        }
+        let mut duplicate = transaction(); duplicate["files"][1]["file"] = json!("src/a.txt");
+        assert!(build_manual_apply_recovery_report(&duplicate, |_| None).is_err());
+        let mut bad_page = transaction(); bad_page["pageUrl"] = json!({"content": "do not echo"});
+        assert!(build_manual_apply_recovery_report(&bad_page, |_| None).is_err());
+        let mut bad_entries = transaction(); bad_entries["entryIds"] = json!([{"content": "do not echo"}]);
+        assert!(build_manual_apply_recovery_report(&bad_entries, |_| None).is_err());
+    }
 }
 
 /// JS: writeManualApplyTransaction({ cwd, pageUrl, batch })
@@ -1187,7 +1366,7 @@ pub fn write_manual_apply_transaction(
     use std::io::Write;
     let _guard = lock_transaction(cwd, env)?;
     let file = manual_apply_transaction_path(cwd, env);
-    match std::fs::metadata(&file) {
+    match std::fs::symlink_metadata(&file) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Ok(_) => return Err("manual_edit_recovery_required".into()),
         Err(e) => return Err(format!("manual_edit_transaction_unreadable: {e}")),
@@ -1236,7 +1415,7 @@ pub fn clear_manual_apply_transaction(cwd: &str, env: &Env, transaction_id: Opti
     let Some(tid) = transaction_id.filter(|s| !s.is_empty()) else { return false; };
     // An absent record needs no mutation or lock; if another process creates
     // one after this check, returning false still leaves its record untouched.
-    if std::fs::metadata(manual_apply_transaction_path(cwd, env)).is_err() {
+    if std::fs::symlink_metadata(manual_apply_transaction_path(cwd, env)).is_err() {
         return false;
     }
     let Ok(_guard) = lock_transaction(cwd, env) else { return false; };
@@ -1259,7 +1438,7 @@ pub fn rollback_manual_apply_transaction(
     let file = manual_apply_transaction_path(cwd, env);
     // Startup recovery is a read-only no-op when no record exists. The
     // record is checked again under lock before any further handling.
-    match std::fs::metadata(&file) {
+    match std::fs::symlink_metadata(&file) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (None, None),
         Err(e) => return (Some(json!({
             "reason": reason, "rolledBackFiles": [],
@@ -1276,7 +1455,7 @@ pub fn rollback_manual_apply_transaction(
             "recoveryRequired": true
         })), None),
     };
-    match std::fs::metadata(&file) {
+    match std::fs::symlink_metadata(&file) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (None, None),
         Err(e) => return (Some(json!({
             "reason": reason, "rolledBackFiles": [],
@@ -1643,7 +1822,7 @@ pub fn resolve_deferred(
     let env = st.env.clone();
     // Preserve the exact dispatched evidence while a transaction is active:
     // source verification may still fail after this reply arrives.
-    if matches!(std::fs::metadata(manual_apply_transaction_path(&deferred.cwd, &env)),
+    if matches!(std::fs::symlink_metadata(manual_apply_transaction_path(&deferred.cwd, &env)),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
         remove_manual_apply_evidence(deferred.event.get("evidencePath"), &deferred.cwd, &env);
     }
@@ -1661,7 +1840,7 @@ pub fn prune_stale_evidence(st: &crate::server_state::ServerState) -> Vec<String
     }
     // An unresolved or unreadable transaction needs its evidence for manual
     // recovery; do not prune it on restart or while Apply is in progress.
-    if !matches!(std::fs::metadata(manual_apply_transaction_path(&cwd, &env)),
+    if !matches!(std::fs::symlink_metadata(manual_apply_transaction_path(&cwd, &env)),
                  Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
         return vec![];
     }
@@ -1853,7 +2032,7 @@ pub fn apply_in_flight(st: &crate::server_state::ServerState, page_url: &str) ->
             .and_then(|p| p.as_str())
             .map(|p| p == page_url)
             .unwrap_or(true),
-        None => match std::fs::metadata(manual_apply_transaction_path(&st.cwd, &st.env)) {
+        None => match std::fs::symlink_metadata(manual_apply_transaction_path(&st.cwd, &st.env)) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             _ => true,
         },
