@@ -736,7 +736,7 @@ pub fn run_stop_hook(rt: &Runtime, stdin: &str) -> RunResult {
         if let Some(skip) = native_skip(&audit, &session_cwd, &mut platform_memo) { return skip; }
     }
     let mut cache = read_cache(&session_cwd);
-    if matches!(harness, "claude" | "codex" | "gemini") {
+    if matches!(harness, "claude" | "codex" | "gemini" | "hermes") {
         if let Some(message) = crate::build_completion::reminder(rt, &session_cwd, &session_id, stop_hook_active, &mut cache) {
             return RunResult {
                 stdout: payload(&message, "Stop", harness),

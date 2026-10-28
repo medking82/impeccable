@@ -2923,6 +2923,41 @@ fn codex_stop_emits_decision_block() {
     assert!(out.get("hookSpecificOutput").is_none());
 }
 
+#[test]
+fn hermes_harness_shapes_each_pass() {
+    // #1178: the Hermes plugin sets the harness explicitly and sends
+    // Claude-shaped events; its pre_verify gate reads Codex's Stop shape.
+    let forced = rt_with("/p", env(&[("IMPECCABLE_HOOK_HARNESS", "hermes")]));
+    let claude = json!({ "hook_event_name": "Stop", "session_id": "s" }).as_object().cloned().unwrap();
+    assert_eq!(resolve_harness(&forced, Some(&claude)), "hermes");
+    assert_eq!(payload("findings", "Stop", "hermes"), r#"{"decision":"block","reason":"findings"}"#);
+    assert_eq!(payload("  ", "Stop", "hermes"), "");
+    assert_eq!(
+        payload("t", "PostToolUse", "hermes"),
+        r#"{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"t"}}"#
+    );
+
+    let t = Tmp::new();
+    let cwd = t.path();
+    let r = rt_with(&cwd, env(&[("IMPECCABLE_HOOK_HARNESS", "hermes")]));
+    let css = t.write("src/a.css", SIDE_TAB_CSS);
+    let edit = json!({
+        "session_id": "h1", "cwd": cwd, "hook_event_name": "PostToolUse",
+        "tool_name": "Write", "tool_input": { "file_path": css },
+    })
+    .to_string();
+    let quiet = hook::run_hook(&r, &edit);
+    assert_eq!(audit_str(&quiet.audit, "harness"), Some("hermes"));
+    assert!(!quiet.stdout.contains("[side-tab]"), "side-tab is deferred to Stop: {}", quiet.stdout);
+    let stop = stop_event(&cwd, "h1");
+    let deep = hook::run_stop_hook(&r, &stop);
+    let out: Value = serde_json::from_str(&deep.stdout).unwrap();
+    assert_eq!(out["decision"], json!("block"));
+    assert!(out["reason"].as_str().unwrap().contains("[side-tab]"));
+    assert!(out.get("hookSpecificOutput").is_none());
+    assert_eq!(hook::run_stop_hook(&r, &stop).stdout, "", "a repeat Stop stays silent");
+}
+
 // ── live-preview stand-down ───────────────────────────────────────────────
 //
 // A live variant session owns files carrying preview scaffolding

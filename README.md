@@ -106,7 +106,7 @@ From the root of your project, run:
 npx impeccable install
 ```
 
-This shows the harness folders or installed CLIs it detected (for example `~/.claude`, `~/.codex`, `~/.grok`, `~/.hermes`, `~/.veto`, or project-local `.cursor`), lets you keep the detected set or customize providers, then asks whether to install into the current project or globally. Use `--providers=claude,codex,replit,cursor,grok,hermes,veto` and `--scope=project|global` to skip those choices in scripts. On Claude Code, Cursor, Codex, GitHub Copilot, and Grok Build, it also installs the provider-native hook manifest for the current project. Veto receives the packaged skill under `~/.veto/skills/` and does not run native Impeccable edit hooks. Works with Cursor, Claude Code, Gemini CLI, Codex CLI, Replit Agent, Grok Build, Hermes Agent, Veto, and every other supported tool. Reload your harness afterward.
+This shows the harness folders or installed CLIs it detected (for example `~/.claude`, `~/.codex`, `~/.grok`, `~/.hermes`, `~/.veto`, or project-local `.cursor`), lets you keep the detected set or customize providers, then asks whether to install into the current project or globally. Use `--providers=claude,codex,replit,cursor,grok,hermes,veto` and `--scope=project|global` to skip those choices in scripts. On Claude Code, Cursor, Codex, GitHub Copilot, and Grok Build, it also installs the provider-native hook manifest for the current project. On Hermes Agent it installs the design hook as a plugin; enable it once with `hermes plugins enable impeccable-design-hook`. Veto receives the packaged skill under `~/.veto/skills/` and does not run native Impeccable edit hooks. Works with Cursor, Claude Code, Gemini CLI, Codex CLI, Replit Agent, Grok Build, Hermes Agent, Veto, and every other supported tool. Reload your harness afterward.
 
 To refresh an existing install, run:
 
@@ -232,8 +232,9 @@ cp -r dist/hermes/.hermes your-project/
 > `hermes skills trust` once from the project root. Global installs into the
 > active `$HERMES_HOME/skills/` (or `~/.hermes/skills/` when unset) load without
 > a trust step. `/impeccable <command>` then
-> routes through the skill's Commands table; the design hook does not install
-> on Hermes (no hook surface).
+> routes through the skill's Commands table. The design hook is a Hermes
+> plugin: `npx impeccable install` places it under `~/.hermes/plugins/`, and
+> you run `hermes plugins enable impeccable-design-hook` once.
 >
 > [Learn more about Hermes skills](https://hermes-agent.nousresearch.com/docs/user-guide/features/skills)
 
@@ -430,6 +431,7 @@ Installed hook surfaces:
 - Cursor: `.cursor/hooks.json` runs `.cursor/skills/impeccable/scripts/impeccable hook` on `postToolUse` for file writes. Projects set up with the older `preToolUse` write gate keep working; `npx impeccable update` moves them to the post-edit hook.
 - Codex: `.codex/hooks.json` runs `.agents/skills/impeccable/scripts/impeccable hook`, with a `commandWindows` sibling that calls `impeccable.cmd` for cmd.exe.
 - Grok Build: `.grok/hooks/impeccable.json` runs `.grok/skills/impeccable/scripts/impeccable hook`. Requires `/hooks-trust` or `--trust`. Findings reach the model on Stop, not after each edit.
+- Hermes Agent: the `impeccable-design-hook` plugin in `~/.hermes/plugins/` runs the skill's launcher on `write_file` and `patch` results and on `pre_verify` before the turn ends. Hermes plugins are opt-in, so run `hermes plugins enable impeccable-design-hook` once.
 
 Every command goes through the launcher shipped in the skill's `scripts/` directory (`impeccable`, or `impeccable.cmd` on Windows), guarded so a missing launcher is a silent no-op. The launcher runs the engine binary that ships next to it, or downloads the pinned version once into `~/.impeccable/bin/`. No Node or other runtime is required for the hook or the skill.
 

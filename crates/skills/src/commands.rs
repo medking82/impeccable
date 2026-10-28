@@ -437,8 +437,21 @@ fn choose_install_plan(sys: &Sys, prompt: &mut Prompt, io: &mut Io, project_root
     Ok(InstallPlan { targets: choice.targets, scope, install_root, hook_root: project_root.to_string(), explicit: choice.explicit })
 }
 
+/// Prints the providers whose hook was written this run, plus the one step
+/// Hermes leaves to the user (#1178) whenever its hook was wanted and the
+/// plugin is installed but not enabled, so a repeat install that writes
+/// nothing still says it and a bundle without the plugin never does.
+fn report_hook_targets(sys: &Sys, io: &mut Io, written: &[&'static str], wanted: &[&'static str]) {
+    if !written.is_empty() {
+        out(io, &format!("Installed hooks into: {}", written.join(", ")));
+    }
+    if wanted.contains(&".hermes") && hook_manifest::hermes_plugin_installed(sys) && !hook_manifest::hermes_plugin_enabled(sys) {
+        out(io, "Enable the Hermes plugin once: hermes plugins enable impeccable-design-hook (a running gateway reloads it; otherwise restart Hermes).");
+    }
+}
+
 /// JS: decideHookInstall(root, targets, {yes})
-fn decide_hook_install(prompt: &mut Prompt, io: &mut Io, root: &str, targets: &[&'static str], yes: bool) -> R<bool> {
+fn decide_hook_install(sys: &Sys, prompt: &mut Prompt, io: &mut Io, root: &str, targets: &[&'static str], yes: bool) -> R<bool> {
     if targets.is_empty() {
         return Ok(false);
     }
@@ -447,7 +460,7 @@ fn decide_hook_install(prompt: &mut Prompt, io: &mut Io, root: &str, targets: &[
         Some("accepted") => return Ok(true),
         _ => {}
     }
-    if targets.iter().all(|p| hook_installed_for_provider(root, p)) {
+    if targets.iter().all(|p| hook_installed_for_provider(sys, root, p)) {
         return Ok(true);
     }
     if yes || !prompt.stdin_tty {
@@ -597,7 +610,7 @@ fn install(flags: &[String], io: &mut Io) -> R<()> {
         let linked_targets = sys.find_linked_providers(&install_root, &selected_installed, scope_opt);
         let copy_targets: Vec<&'static str> = selected_installed.iter().copied().filter(|p| !linked_targets.contains(p)).collect();
         let hook_targets: Vec<&'static str> = selected_installed.iter().chain(missing_selected_targets.iter()).copied().collect();
-        let want_hooks = install_hooks && decide_hook_install(&mut prompt, io, &hook_root, &hook_targets, yes)?;
+        let want_hooks = install_hooks && decide_hook_install(&sys, &mut prompt, io, &hook_root, &hook_targets, yes)?;
         let mut bundle_dir: Option<String> = None;
         let outcome: Result<(), String> = (|| {
             if !linked_targets.is_empty() {
@@ -614,7 +627,7 @@ fn install(flags: &[String], io: &mut Io) -> R<()> {
                     .copied()
                     .filter(|p| {
                         let manifest_root = if scope == Scope::User && *p == ".claude" { &install_root } else { &hook_root };
-                        !hook_installed_for_provider_at_scope(manifest_root, p, scope == Scope::User)
+                        !hook_installed_for_provider_at_scope(&sys, manifest_root, p, scope == Scope::User)
                     })
                     .collect()
             } else {
@@ -671,9 +684,7 @@ fn install(flags: &[String], io: &mut Io) -> R<()> {
             } else {
                 Vec::new()
             };
-            if !written_hook_targets.is_empty() {
-                out(io, &format!("Installed hooks into: {}", written_hook_targets.join(", ")));
-            }
+            report_hook_targets(&sys, io, &written_hook_targets, if want_hooks { &hook_targets } else { &[] });
             // A repeat user-scope install whose user hook is already current
             // never sends Claude through copy_provider_hooks, so the
             // duplicate-hook cleanup that function ends with runs here as well.
@@ -719,7 +730,7 @@ fn install(flags: &[String], io: &mut Io) -> R<()> {
         return Err(Flow::Exit(1));
     }
 
-    let want_hooks = install_hooks && decide_hook_install(&mut prompt, io, &hook_root, &targets, yes)?;
+    let want_hooks = install_hooks && decide_hook_install(&sys, &mut prompt, io, &hook_root, &targets, yes)?;
 
     out(io, "\nDownloading impeccable skills...");
     let bundle_dir = match bundle::download_and_extract_bundle(&sys) {
@@ -764,9 +775,7 @@ fn install(flags: &[String], io: &mut Io) -> R<()> {
     ));
     install_engine_binaries(&sys, io, &written);
     bundle::report_provider_agents(&sys, io, &agent_results);
-    if !hook_targets.is_empty() {
-        out(io, &format!("Installed hooks into: {}", hook_targets.join(", ")));
-    }
+    report_hook_targets(&sys, io, &hook_targets, if want_hooks { &targets } else { &[] });
     out(io, "\nDone! Now type /impeccable init in your AI coding agent's chat (not in this terminal) to set up design context.\n");
     Ok(())
 }
@@ -865,26 +874,24 @@ fn update(flags: &[String], io: &mut Io) -> R<()> {
         }
     };
     if up_to_date {
-        let outcome: R<Vec<&'static str>> = (|| {
+        let outcome: R<(Vec<&'static str>, bool)> = (|| {
             // Repair any stale pre-launcher (`node .../hook.mjs`) manifest a v3
             // install left behind, regardless of hook consent (triage E8).
             repair_update_hook_manifests(&sys, &hook_root, &root, &copy_providers).map_err(Flow::Throw)?;
-            let want_hooks = install_hooks && decide_hook_install(&mut prompt, io, &hook_root, &copy_providers, yes)?;
+            let want_hooks = install_hooks && decide_hook_install(&sys, &mut prompt, io, &hook_root, &copy_providers, yes)?;
             let hook_targets = if want_hooks {
                 copy_provider_hooks(&sys, &tmp_dir, &hook_root, &copy_providers, force, Some(&root), Some(&project_root)).map_err(Flow::Throw)?
             } else {
                 Vec::new()
             };
-            Ok(hook_targets)
+            Ok((hook_targets, want_hooks))
         })();
         util::rm_rf(&tmp_dir);
         return match outcome {
-            Ok(hook_targets) => {
+            Ok((hook_targets, want_hooks)) => {
                 let v = sys.get_skills_version(&root, scope);
                 out(io, &format!("Skills are up to date{}.", version_suffix(&v)));
-                if !hook_targets.is_empty() {
-                    out(io, &format!("Installed hooks into: {}", hook_targets.join(", ")));
-                }
+                report_hook_targets(&sys, io, &hook_targets, if want_hooks { &copy_providers } else { &[] });
                 out(io, "Nothing else to do.");
                 Err(Flow::Exit(0))
             }
@@ -925,7 +932,7 @@ fn update(flags: &[String], io: &mut Io) -> R<()> {
         // Repair any stale pre-launcher (`node .../hook.mjs`) manifest a v3
         // install left behind, regardless of hook consent (triage E8).
         repair_update_hook_manifests(&sys, &hook_root, &root, &copy_providers).map_err(Flow::Throw)?;
-        let want_hooks = install_hooks && decide_hook_install(&mut prompt, io, &hook_root, &providers, yes)?;
+        let want_hooks = install_hooks && decide_hook_install(&sys, &mut prompt, io, &hook_root, &providers, yes)?;
         let hook_targets = if want_hooks {
             copy_provider_hooks(&sys, &tmp_dir, &hook_root, &providers, force, Some(&root), Some(&project_root)).map_err(Flow::Throw)?
         } else {
@@ -935,9 +942,7 @@ fn update(flags: &[String], io: &mut Io) -> R<()> {
         let v = sys.get_skills_version(&root, scope);
         out(io, &format!("Updated {} skill(s){}.", refreshed.len(), to_version_suffix(&v)));
         install_engine_binaries(&sys, io, &refreshed);
-        if !hook_targets.is_empty() {
-            out(io, &format!("Installed hooks into: {}", hook_targets.join(", ")));
-        }
+        report_hook_targets(&sys, io, &hook_targets, if want_hooks { &providers } else { &[] });
         out(io, "Done!\n");
         Ok(())
     })();
