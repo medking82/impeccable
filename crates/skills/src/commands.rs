@@ -81,6 +81,11 @@ fn err(io: &mut Io, line: &str) {
     io.err(&format!("{line}\n"));
 }
 
+/// The manifest paths a hook install wrote, home-relative paths shown as `~/...`.
+fn hook_paths_line(sys: &Sys, dests: &[String]) -> String {
+    dests.iter().map(|d| sys.format_path_for_display(d)).collect::<Vec<_>>().join(", ")
+}
+
 // ─── help ────────────────────────────────────────────────────────────────────
 
 /// JS: showHelp()
@@ -437,13 +442,13 @@ fn choose_install_plan(sys: &Sys, prompt: &mut Prompt, io: &mut Io, project_root
     Ok(InstallPlan { targets: choice.targets, scope, install_root, hook_root: project_root.to_string(), explicit: choice.explicit })
 }
 
-/// Prints the providers whose hook was written this run, plus the one step
+/// Prints the hook manifest paths written this run, plus the one step
 /// Hermes leaves to the user (#1178) whenever its hook was wanted and the
 /// plugin is installed but not enabled, so a repeat install that writes
 /// nothing still says it and a bundle without the plugin never does.
-fn report_hook_targets(sys: &Sys, io: &mut Io, written: &[&'static str], wanted: &[&'static str]) {
+fn report_hook_targets(sys: &Sys, io: &mut Io, written: &[String], wanted: &[&'static str]) {
     if !written.is_empty() {
-        out(io, &format!("Installed hooks into: {}", written.join(", ")));
+        out(io, &format!("Installed hooks into: {}", hook_paths_line(sys, written)));
     }
     if wanted.contains(&".hermes") && hook_manifest::hermes_plugin_installed(sys) && !hook_manifest::hermes_plugin_enabled(sys) {
         out(io, "Enable the Hermes plugin once: hermes plugins enable impeccable-design-hook (a running gateway reloads it; otherwise restart Hermes).");
@@ -743,7 +748,7 @@ fn install(flags: &[String], io: &mut Io) -> R<()> {
 
     sys.migrate_unprefix_impeccable(&install_root, scope_opt);
 
-    let outcome: Result<(Vec<String>, Vec<bundle::AgentResult>, Vec<&'static str>), String> = (|| {
+    let outcome: Result<(Vec<String>, Vec<bundle::AgentResult>, Vec<String>), String> = (|| {
         let written = bundle::copy_provider_skills(&sys, &bundle_dir, &install_root, &targets, scope_opt)?;
         let agents = bundle::copy_provider_agents(&sys, &bundle_dir, &install_root, &targets, scope_opt)?;
         bundle::copy_provider_commands(&sys, &bundle_dir, &install_root, &targets, scope_opt);
@@ -874,7 +879,7 @@ fn update(flags: &[String], io: &mut Io) -> R<()> {
         }
     };
     if up_to_date {
-        let outcome: R<(Vec<&'static str>, bool)> = (|| {
+        let outcome: R<(Vec<String>, bool)> = (|| {
             // Repair any stale pre-launcher (`node .../hook.mjs`) manifest a v3
             // install left behind, regardless of hook consent (triage E8).
             repair_update_hook_manifests(&sys, &hook_root, &root, &copy_providers).map_err(Flow::Throw)?;

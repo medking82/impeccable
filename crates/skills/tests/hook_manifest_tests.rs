@@ -715,6 +715,38 @@ fn user_scope_keeps_project_hook_when_bundle_has_no_replacement() {
 }
 
 #[test]
+fn user_scope_install_reports_each_manifest_path_it_wrote() {
+    // #1190: the success line named provider dirs, hiding that Codex and Grok
+    // manifests land in the project while the Claude hook lands in home.
+    let dir = tmp_dir("user-scope-hook-paths");
+    let root = dir.to_string_lossy().into_owned();
+    let bundle = jsp::join(&[&root, "bundle"]);
+    let home = jsp::join(&[&root, "home"]);
+    let project = jsp::join(&[&root, "project"]);
+    write(&jsp::join(&[&bundle, ".claude", "settings.json"]), &claude_bundle_manifest().to_string());
+    write(&jsp::join(&[&bundle, ".codex", "hooks.json"]), &claude_bundle_manifest().to_string());
+    write(&jsp::join(&[&bundle, ".grok", "hooks", "impeccable.json"]), &claude_bundle_manifest().to_string());
+    std::fs::create_dir_all(&project).unwrap();
+    // Windows reads home from USERPROFILE, so set both for the scope check.
+    let mut env = HashMap::new();
+    env.insert("HOME".to_string(), home.clone());
+    env.insert("USERPROFILE".to_string(), home.clone());
+    let sys = Sys::new(env, home.clone());
+
+    let written = copy_provider_hooks(&sys, &bundle, &project, &[".claude", ".agents", ".grok"], false, Some(&home), Some(&project)).unwrap();
+
+    assert_eq!(
+        written,
+        [
+            jsp::join(&[&home, ".claude", "settings.json"]),
+            jsp::join(&[&project, ".codex", "hooks.json"]),
+            jsp::join(&[&project, ".grok", "hooks", "impeccable.json"]),
+        ]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn github_user_scope_install_points_the_project_hook_at_the_home_skill() {
     // #1098: a global install wrote the portable project form into the
     // project's manifest, naming `.github/skills/...` in a project that has
@@ -737,7 +769,7 @@ fn github_user_scope_install_points_the_project_hook_at_the_home_skill() {
     assert!(hook_installed_for_provider_at_scope(&sys, &project, ".github", false));
 
     let written = copy_provider_hooks(&sys, &bundle, &project, &[".github"], false, Some(&home), Some(&project)).unwrap();
-    assert_eq!(written, [".github"]);
+    assert_eq!(written, [manifest.clone()]);
     let after: Value = serde_json::from_str(&read(&manifest)).unwrap();
     let gp = skill_launcher(&home, ".github");
     let expected = if cfg!(windows) {
