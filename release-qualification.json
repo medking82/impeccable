@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "runnerRepository": "medking82/hermes-fleet-sync",
+  "runnerCommit": "4f79a5b4452d9a91037e4cbf564a927b44e2bac6",
+  "projects": {
+    "offline": {
+      "scope": "targeted-offline",
+      "localReuse": false,
+      "suites": [
+        {
+          "name": "release-contracts",
+          "argv": [
+            "bash", "-euo", "pipefail", "-c",
+            "test \"$(bun --version)\" = 1.3.14; bun --version; exec node --test tests/ci-test-plan.test.mjs tests/release.test.mjs tests/check-engine-release.test.mjs tests/publish-platform-packages.test.mjs"
+          ],
+          "timeout": 600
+        }
+      ]
+    }
+  }
+}
