@@ -1,6 +1,14 @@
 use super::*;
 
 #[test]
+fn connect_answer_requires_input_but_defaults_enter_to_yes() {
+    assert!(!connect_answer(0, ""), "EOF is not an answer");
+    assert!(connect_answer(1, "\n"), "Enter accepts the default");
+    assert!(connect_answer(2, "y\n"));
+    assert!(!connect_answer(2, "n\n"));
+}
+
+#[test]
 fn platform_refuses_non_macos() {
     assert_eq!(
         check_platform("linux").unwrap_err(),
@@ -97,6 +105,20 @@ mod mac {
         fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
         fs::copy("/bin/sleep", app.join("Contents/MacOS/Impeccable Loop")).unwrap();
         fs::write(app.join("Contents/Info.plist"), format!(r#"<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleExecutable</key><string>Impeccable Loop</string><key>CFBundleShortVersionString</key><string>{version}</string></dict></plist>"#)).unwrap();
+        // The Info.plist invalidates the copied binary's Apple signature, so macOS kills the
+        // launched bundle and shows a "damaged" dialog. Re-sign it ad hoc.
+        assert!(Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(&app)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/codesign")
+            .arg("--verify")
+            .arg(&app)
+            .status()
+            .unwrap()
+            .success());
         let zip = root.join("fixture.zip");
         assert!(Command::new("/usr/bin/ditto")
             .args(["-c", "-k", "--keepParent"])
@@ -234,8 +256,17 @@ mod mac {
             "1.0.0"
         );
         assert!(run_inner(&args("install"), &io, &pins, "macos")
-            .unwrap_err()
+            .unwrap()
             .contains("already installed"));
+        // Catches (#1466 review): install opening Loop while an update holds the lock,
+        // restarting the app the update is quitting or replacing.
+        {
+            let _held = install_lock(&apps).unwrap();
+            assert_eq!(
+                run_inner(&args("install"), &io, &pins, "macos").unwrap_err(),
+                "Another Loop install or update is in progress."
+            );
+        }
         assert!(run_inner(&args("update"), &io, &pins, "macos")
             .unwrap()
             .contains("already current"));
@@ -368,4 +399,28 @@ mod mac {
         assert!(result.contains("already current"));
         clean(&apps);
     }
+}
+
+#[test]
+fn after_install_never_connects_unasked_when_no_person_is_there() {
+    // Catches: an agent or script running `loop install` having its agents' config
+    // rewritten without being asked. Only --connect or a person's yes connects.
+    let home = std::env::temp_dir().join(format!("impeccable-loop-after-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(&home).unwrap();
+    let env = std::collections::HashMap::from([(
+        "HOME".to_string(),
+        home.to_string_lossy().into_owned(),
+    )]);
+    let (mut io, cap) = Io::captured("", home.clone(), env);
+    assert_eq!(after_install(&mut io, false, crate::loop_connect::Taste::Ask), 0);
+    assert_eq!(
+        String::from_utf8_lossy(&cap.stdout.borrow()),
+        "Next: impeccable loop connect, so your agents bring their questions to Loop.\n"
+    );
+    assert!(!home.join(".claude").exists() && !home.join(".codex").exists());
+    // --connect tries at once, and a failure names how to finish (no Loop app in this home).
+    assert_eq!(after_install(&mut io, true, crate::loop_connect::Taste::Ask), 1);
+    let err = String::from_utf8_lossy(&cap.stderr.borrow()).into_owned();
+    assert!(err.ends_with("Loop is installed. Run impeccable loop connect again once that is sorted.\n"), "{err}");
 }

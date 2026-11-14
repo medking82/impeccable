@@ -3,6 +3,13 @@
 //! (storage, lock, generation, logout tombstone). docs/RUNTIME-ENV.md (Account sign-in) has the
 //! whole contract. Tokens are never printed or logged.
 
+// Reuse the integration fake issuer in unit tests, including its Pro helpers.
+#[cfg(test)]
+extern crate self as impeccable_account;
+#[cfg(test)]
+#[path = "../tests/support/fake.rs"]
+mod test_fake;
+
 pub mod config;
 pub mod critiques;
 mod design_read;
@@ -13,9 +20,12 @@ pub mod plans;
 pub mod pro;
 pub mod session;
 pub mod setup;
+pub mod setup_status;
 mod stale_grant;
 pub mod store;
+pub mod taste;
 mod upload_notice;
+pub mod world;
 
 use config::Account;
 use impeccable_common::Io;
@@ -82,8 +92,11 @@ pub fn login(
             .as_ref()
             .and_then(|s| Some((s.revocation_endpoint.clone()?, store.secret(s)?)));
         let generation = previous.as_ref().map(|s| s.generation).unwrap_or(0) + 1;
+        // A new sign-in may be another person: their taste is never the last one's.
+        store.clear_taste(&lock);
         let state = State {
             foundations: tokens.foundations,
+            taste: tokens.taste,
             scopes: tokens.scopes.unwrap_or_default(),
             schema: 1,
             issuer: account.issuer.clone(),
@@ -166,8 +179,13 @@ pub fn run_login(args: &[String], io: &mut Io) -> i32 {
         io.out(LOGIN_USAGE);
         return 0;
     }
-    if unknown_args(args, &["--no-browser"], io, "login") {
+    if unknown_args(args, &["--no-browser", "--force"], io, "login") {
         return 1;
+    }
+    if !has_flag(args, "--force") {
+        if let Some(code) = already_signed_in(io) {
+            return code;
+        }
     }
     let no_browser = has_flag(args, "--no-browser") || io.env_truthy("IMPECCABLE_NO_BROWSER");
     let timeout = io
@@ -205,12 +223,42 @@ pub fn run_login(args: &[String], io: &mut Io) -> i32 {
                 }
                 Err(_) => report_entitlement(io, &done.entitlement),
             }
+            setup_status::after_login(io, &done.account);
             0
         }
         Err(e) => {
             io.err(&format!("Sign-in failed: {e}.\n"));
             1
         }
+    }
+}
+
+/// `login` on a machine already signed in to this account: say so and stop, with no
+/// browser. `None` when there is no usable sign-in (none, expired, ended by the
+/// service, unreadable), so the browser sign-in goes ahead.
+fn already_signed_in(io: &mut Io) -> Option<i32> {
+    let account = Account::from_env(&io.env).ok()?;
+    let mut session = Session::load(&account).ok()?;
+    // A sign-in missing a scope the service now offers is the one the "needs a fresh
+    // sign-in" notices send here: that one signs in again.
+    if stale_grant::fresh_sign_in_adds(&account, &session.state) {
+        return None;
+    }
+    let login = session.state.login;
+    let name = account.display_name();
+    match session::entitlement(&mut session) {
+        Ok(e) => {
+            pro::settle(&account, login, e.pro);
+            io.err(&format!("Already signed in to {name}. To sign in again: impeccable login --force\n"));
+            report_entitlement(io, &Ok(e));
+            Some(0)
+        }
+        // Offline or the service is down: the sign-in stored here still stands.
+        Err(SessionError::Api(e)) => {
+            io.err(&format!("Already signed in to {name}. Couldn't reach it to check the sign-in: {e}.\n"));
+            Some(0)
+        }
+        Err(_) => None,
     }
 }
 
@@ -347,12 +395,14 @@ pub fn run_whoami(args: &[String], io: &mut Io) -> i32 {
     }
 }
 
-const LOGIN_USAGE: &str = "Usage: impeccable login [--no-browser]
+const LOGIN_USAGE: &str = "Usage: impeccable login [--no-browser] [--force]
 
-Sign in to your Impeccable account in the browser.
+Sign in to your Impeccable account in the browser. Already signed in, it says so
+and opens nothing.
 
 Options:
   --no-browser   Print the sign-in link on stdout instead of opening a browser
+  --force        Sign in again even when already signed in
 ";
 
 /// Start the system browser on `url`. Never through a shell: the URL is an
