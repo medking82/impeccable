@@ -8,7 +8,7 @@ use crate::{
 use impeccable_common::Io;
 use std::time::Duration;
 
-const NOTICE: &str = "Saving to your Impeccable account needs a fresh sign-in. Run impeccable login to turn it on.\n";
+const NOTICE: &str = "Saving to your Impeccable account needs a fresh sign-in. Run npx impeccable login to turn it on.\n";
 const DEADLINE: Duration = Duration::from_secs(2);
 
 /// `within` is what is left of the caller's own wait: the check never extends it.
@@ -48,7 +48,7 @@ fn offered(m: &oauth::Metadata, scope: &str) -> bool {
         oauth::CRITIQUES_SCOPE => m.critiques,
         oauth::WORLDS_SCOPE => m.worlds,
         "setup:write" => m.setup,
-        _ => false,
+        other => m.mcp.contains(&other),
     }
 }
 
@@ -83,8 +83,10 @@ fn holds(account: &Account, state: &State, scope: &str) -> bool {
 /// then `login` signs in again rather than saying it already is.
 /// Every scope `oauth::scopes` can ask for is checked, against one metadata read.
 pub(crate) fn fresh_sign_in_adds(account: &Account, state: &State) -> bool {
+    // The MCP scopes (`impeccable mcp`, REN-2053) too, where the service offers them.
     let missing: Vec<&str> = OPTIONAL
         .into_iter()
+        .chain(oauth::MCP_SCOPES)
         .filter(|scope| !holds(account, state, scope))
         .collect();
     if missing.is_empty() {
@@ -109,6 +111,16 @@ pub(crate) fn status(io: &Io, scope: &str) -> bool {
         })
 }
 
+fn notice_path(account: &Account, login: u64) -> std::path::PathBuf {
+    account.dir().join(format!("stale-grant-notice-{login}"))
+}
+
+/// A feature told the person to sign in again in its own words, so the shared
+/// notice is not owed on this login any more.
+pub(crate) fn mark_shown(account: &Account, login: u64) {
+    let _ = store::write_private(&notice_path(account, login), b"shown");
+}
+
 /// `scope` is absent for a health 403, which is itself enough evidence.
 /// `within` is what is left of the upload's wait; with none left the notice stays owed.
 pub(crate) fn emit(
@@ -123,7 +135,7 @@ pub(crate) fn emit(
         return;
     }
     let store = Store::new(account);
-    let path = account.dir().join(format!("stale-grant-notice-{login}"));
+    let path = notice_path(account, login);
     let shown = || store::read_private(&path).ok().flatten().is_some();
     if shown() {
         return;

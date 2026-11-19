@@ -58,18 +58,24 @@ fn place_name(kind: &str) -> String {
 /// One step as the service wrote it: its label, then what to run or open.
 fn step_line(step: &Value) -> Option<String> {
     let label = step["label"].as_str().map(clean).filter(|l| !l.is_empty())?;
-    let action = step["command"]
-        .as_str()
-        .or_else(|| step["url"].as_str().filter(|u| u.starts_with("https://")))
-        .map(clean)
-        .filter(|a| !a.is_empty());
-    Some(match action {
-        Some(a) => format!("{label}: {a}"),
-        None => label.to_string(),
+    let command = step["command"].as_str().map(clean).filter(|a| !a.is_empty());
+    let url = step["url"].as_str().filter(|u| u.starts_with("https://")).map(clean).filter(|a| !a.is_empty());
+    // A command reads inline; a link goes on a line of its own, where a wrap can't split it inside the sentence.
+    Some(match (command, url) {
+        (Some(c), _) => format!("{label}: {c}"),
+        (None, Some(u)) => format!("{label}:\n{u}"),
+        (None, None) => label.to_string(),
     })
 }
 
-/// At most three lines: what is connected, what isn't yet, and the one next
+/// The agent place's `fix` line, when a machine reported something wrong.
+fn agent_fix(v: &Value) -> Option<String> {
+    let p = v["places"].as_array()?.iter().find(|p| p["kind"] == "agent")?;
+    let line = p["fix"]["line"].as_str().map(clean)?;
+    Some(line.trim_end_matches('.').to_string()).filter(|l| !l.is_empty())
+}
+
+/// At most four lines: what is connected, what isn't yet, what a machine reported wrong, and the one next
 /// step. A place the service marks `unavailable`, or with a state this
 /// version doesn't know, is left out rather than guessed at.
 pub fn lines(v: &Value) -> String {
@@ -84,7 +90,7 @@ pub fn lines(v: &Value) -> String {
             Some("on") => on.push(name),
             Some("quiet") => on.push(format!("{name} (quiet)")),
             Some("off") => off.push(name),
-            Some("needs-pro") => off.push(format!("{name} (Pro)")),
+            // Pro isn't on sale yet: what a plan doesn't include isn't listed (Paul, 17 Nov).
             _ => {}
         }
     }
@@ -95,7 +101,11 @@ pub fn lines(v: &Value) -> String {
     if !off.is_empty() {
         out.push_str(&format!("Not connected yet: {}.\n", off.join(", ")));
     }
-    if let Some(next) = v.get("next").filter(|n| n.is_object()).and_then(step_line) {
+    // What a machine reports wrong; the service's next step carries its command.
+    if let Some(line) = agent_fix(v) {
+        out.push_str(&format!("{line}.\n"));
+    }
+    if let Some(next) = v.get("next").filter(|n| n.is_object() && n["id"] != "upgrade").and_then(step_line) {
         out.push_str(&format!("Next: {next}\n"));
     }
     out
@@ -115,23 +125,56 @@ fn project_line(v: &Value) -> Option<String> {
 /// login's words, so stdout keeps only what a script reads. Quiet when the
 /// read fails: the sign-in already worked.
 pub fn after_login(io: &mut Io, account: &Account) {
-    let Ok(mut session) = Session::load(account) else { return };
-    let cwd = io.cwd.to_string_lossy().into_owned();
-    if let Ok(v) = read(&mut session, &cwd, &io.env) {
-        if usable(&v) {
-            let text = lines(&v);
-            if text.lines().any(|l| l.starts_with("Next: ") && l.contains("impeccable loop connect")) {
-                NAMED_LOOP_CONNECT.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-            io.err(&text);
-        }
+    if let Some(v) = read_for(io, account) {
+        print(io, &v);
     }
+}
+
+/// The service's setup answer for this folder, when it gave one this client can draw.
+pub fn read_for(io: &Io, account: &Account) -> Option<Value> {
+    let mut session = Session::load(account).ok()?;
+    let cwd = io.cwd.to_string_lossy().into_owned();
+    read(&mut session, &cwd, &io.env).ok().filter(usable)
+}
+
+/// The answer's lines on stderr, as `login` ends.
+pub fn print(io: &mut Io, v: &Value) {
+    let text = lines(v);
+    if text.lines().any(|l| l.starts_with("Next: ") && l.contains("impeccable loop connect")) {
+        NAMED_LOOP_CONNECT.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(steps) = impeccable_common::steps::Steps::new(io) {
+        // One step, its places as lines under it, and the next step's link on a line of its own.
+        steps.done(io, "Your setup", &[]);
+        let mut lines = text.lines().peekable();
+        while let Some(line) = lines.next() {
+            match lines.next_if(|n| n.starts_with("https://")) {
+                Some(url) => steps.link(io, line, url),
+                None => steps.details(io, &[line.to_string()]),
+            }
+        }
+        return;
+    }
+    // Set apart from the sign-in lines above it.
+    io.err(&format!("\n{text}"));
+}
+
+/// Whether the answer's plan includes Loop: Pro, Team and Enterprise do, Free doesn't.
+pub fn plan_includes_loop(v: &Value) -> bool {
+    matches!(v["plan"]["tier"].as_str(), Some(tier) if tier != "free")
 }
 
 const USAGE: &str = "Usage: impeccable status [--json]\n\nShows what Impeccable is connected to for your account (your agent, its tools,\nLoop, the Chrome extension and GitHub pull requests), this project when your\naccount knows it, and the one next step.\n\n  --json   Print the account service's answer as it came.\n";
 
 /// `impeccable status [--json]`.
 pub fn run(args: &[String], io: &mut Io) -> i32 {
+    run_with(args, io, &|_| String::new())
+}
+
+/// `run`, with `local` building (only when text output prints it) what this machine knows that the service doesn't, such as the
+/// Impeccable block in each agent's rule file) printed after the project line and before
+/// the service's own lines, so the next step stays last. The JSON form never carries it.
+pub fn run_with(args: &[String], io: &mut Io, local: &dyn Fn(&Io) -> String) -> i32 {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         io.out(USAGE);
         return 0;
@@ -158,7 +201,7 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
             return 1;
         }
         Err(SessionError::NotSignedIn | SessionError::Expired) => {
-            io.err("Not signed in. Run impeccable login.\n");
+            io.err("Not signed in. Run npx impeccable login.\n");
             return 1;
         }
         Err(SessionError::Api(ApiError::Status { status: 404, .. })) => {
@@ -178,6 +221,9 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
     if let Some(line) = project_line(&v) {
         io.out(&line);
     }
+    // Built only here, where it prints: help, --json and errors never read the files.
+    let local = local(io);
+    io.out(&local);
     io.out(&lines(&v));
     0
 }
@@ -209,9 +255,19 @@ mod tests {
         assert_eq!(
             lines(&example()),
             "Connected: Your agent, Loop (quiet), telepathy.\n\
-             Not connected yet: Agent tools, Chrome extension (Pro).\n\
-             Next: Add to GitHub: https://github.com/apps/impeccable-critique/installations/new\n"
+             Not connected yet: Agent tools.\n\
+             Next: Add to GitHub:\n\
+             https://github.com/apps/impeccable-critique/installations/new\n"
         );
+    }
+
+    #[test]
+    fn an_account_without_pro_is_never_pointed_at_it() {
+        // Catches (Paul, 17 Nov): setup lines steering an account toward Pro before it's on sale.
+        let mut v = example();
+        v["next"] = json!({ "id": "upgrade", "place": "extension", "label": "Get Pro", "url": "https://impeccable.style/pro", "command": null });
+        let text = lines(&v);
+        assert!(!text.contains("Pro") && !text.contains("Next"), "{text}");
     }
 
     #[test]
@@ -224,6 +280,21 @@ mod tests {
         // A url that isn't https is never shown to open.
         v["next"] = json!({ "id": "get-loop", "place": "loop", "label": "Get it for Mac", "url": "javascript:alert(1)", "command": null });
         assert!(lines(&v).ends_with("Next: Get it for Mac\n"));
+    }
+
+    // Catches a machine's reported problem dropped from status, or drawn with its
+    // terminal escapes.
+    #[test]
+    fn names_what_a_machine_reported_before_the_repair_step() {
+        let mut v = example();
+        v["places"][0]["fix"] = json!({ "line": "A change to Impeccable didn't finish on your Linux machine\u{1b}[2J", "command": "npx impeccable loop connect" });
+        v["next"] = json!({ "id": "repair-agent", "place": "agent", "label": "Repair", "url": null, "command": "npx impeccable loop connect" });
+        let text = lines(&v);
+        assert!(
+            text.ends_with("A change to Impeccable didn't finish on your Linux machine[2J.\nNext: Repair: npx impeccable loop connect\n"),
+            "{text}"
+        );
+        assert!(!lines(&example()).contains("finish"));
     }
 
     #[test]
@@ -240,7 +311,7 @@ mod tests {
     fn a_server_string_never_carries_a_terminal_escape() {
         let mut v = example();
         v["next"]["label"] = "Add\u{1b}[31m to\nGitHub".into();
-        assert!(lines(&v).ends_with("Next: Add[31m toGitHub: https://github.com/apps/impeccable-critique/installations/new\n"));
+        assert!(lines(&v).ends_with("Next: Add[31m toGitHub:\nhttps://github.com/apps/impeccable-critique/installations/new\n"));
     }
 
     #[test]
@@ -249,5 +320,16 @@ mod tests {
         assert!(usable(&v));
         v["version"] = 2.into();
         assert!(!usable(&v));
+    }
+
+    // Catches Loop offered to Free after install's sign-in, or withheld from a paid plan.
+    #[test]
+    fn loop_comes_with_every_plan_but_free() {
+        for (tier, want) in [("free", false), ("pro", true), ("team", true)] {
+            let mut v = example();
+            v["plan"]["tier"] = tier.into();
+            assert_eq!(plan_includes_loop(&v), want, "{tier}");
+        }
+        assert!(!plan_includes_loop(&json!({})));
     }
 }

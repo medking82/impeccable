@@ -56,6 +56,13 @@ fn write(env: &HashMap<String, String>, root: &Path) -> Output {
     .output()
     .unwrap()
 }
+/// The line a save printed after the report's path, if any.
+fn said(out: &Output) -> String {
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut lines = text.lines();
+    assert!(Path::new(lines.next().unwrap_or("").trim()).is_file(), "{text}");
+    lines.collect::<Vec<_>>().join("\n")
+}
 fn setup(name: &str) -> (Fake, HashMap<String, String>) {
     let fake = Fake::start();
     fake.knobs.lock().unwrap().critiques = true;
@@ -131,7 +138,7 @@ fn gates_and_service_failures_preserve_the_saved_report() {
         .success());
     let mut ci = env.clone();
     ci.insert("CI".into(), "1".into());
-    write(&ci, root);
+    assert_eq!(said(&write(&ci, root)), "");
     std::fs::create_dir_all(root.join(".impeccable")).unwrap();
     std::fs::write(
         root.join(".impeccable/config.json"),
@@ -145,12 +152,20 @@ fn gates_and_service_failures_preserve_the_saved_report() {
         r#"{"reports":{"enabled":true}}"#,
     )
     .unwrap();
-    for status in [404, 403, 500] {
+    // Every refusal keeps the report and says why in one line, with the fix.
+    for (status, reason) in [
+        (401, "your sign-in expired; sign in again with npx impeccable login"),
+        (403, "this sign-in can't save critiques; sign in again with npx impeccable login"),
+        (409, "it was made before you deleted your critique history"),
+        (429, "you've reached the upload limit (10 a minute, 200 a day); the next critique after that will upload"),
+        (404, "the account service had a problem (HTTP 404); the next critique will upload"),
+        (500, "the account service had a problem (HTTP 500); the next critique will upload"),
+    ] {
         fake.route("POST", "/cli/v1/critiques", status, vec![], "{}");
         let out = write(&env, root);
         assert!(out.status.success());
         assert!(out.stderr.is_empty());
-        assert!(Path::new(String::from_utf8_lossy(&out.stdout).trim()).is_file());
+        assert_eq!(said(&out), format!("Not saved to Impeccable: {reason}"), "HTTP {status}");
     }
     let gate = fake.hold("/cli/v1/critiques");
     let start = std::time::Instant::now();
@@ -158,6 +173,7 @@ fn gates_and_service_failures_preserve_the_saved_report() {
     gate.open();
     assert!(out.status.success());
     assert!(start.elapsed() < std::time::Duration::from_secs(4));
+    assert!(said(&out).starts_with("Not saved to Impeccable: "), "{}", said(&out));
 }
 #[test]
 fn sign_in_requests_only_advertised_scopes_and_a_declined_scope_sends_nothing() {
@@ -539,14 +555,15 @@ fn invalid_service_settings_never_prevent_local_optout() {
 }
 
 #[test]
-fn repo_labels_use_the_remote_name_and_are_omitted_when_unavailable() {
+fn repo_labels_use_the_remote_or_folder_name_and_are_omitted_when_invalid() {
     for (name, remote, expected) in [
         (
             "named",
             Some("git@GitHub.com:acme/remote-repo.git"),
             Some("remote-repo"),
         ),
-        ("local", None, None),
+        // No remote: the folder's name (Paul, REN-2028).
+        ("local", None, Some("<folder>")),
         ("invalid", Some("git@github.com:acme/bad\\name.git"), None),
     ] {
         let (fake, env) = setup(&format!("critique-label-{name}"));
@@ -573,6 +590,7 @@ fn repo_labels_use_the_remote_name_and_are_omitted_when_unavailable() {
         assert_eq!(record.critiques.len(), 1);
         let body = &record.critiques[0];
         assert!(body["repoKey"].as_str().is_some());
+        let expected = if expected == Some("<folder>") { root.file_name().and_then(|n| n.to_str()) } else { expected };
         assert_eq!(
             body.get("label").and_then(serde_json::Value::as_str),
             expected
@@ -629,15 +647,15 @@ fn the_service_accepts_optional_labels_only_with_repo_keys() {
 }
 
 #[test]
-fn critique_notice_is_once_after_success_and_again_after_sign_in() {
+fn every_save_links_its_critique_and_the_first_on_a_sign_in_says_how_to_stop() {
     let (fake, env) = setup("critique-notice");
     let root = Path::new(&env["IMPECCABLE_HOME"]);
-    let notice = "Uploaded this critique report to your Impeccable account. Each report you save uploads too. To stop: impeccable critiques off\n";
+    let stop = " Every critique you save uploads; to stop: impeccable critiques off";
     let hook = impeccable(&env, root, &["hook-before-edit"])
         .output()
         .unwrap();
-    assert!(!String::from_utf8_lossy(&hook.stdout).contains(notice));
-    assert!(!String::from_utf8_lossy(&hook.stderr).contains(notice));
+    assert!(!String::from_utf8_lossy(&hook.stdout).contains("Impeccable:"));
+    assert!(!String::from_utf8_lossy(&hook.stderr).contains("Impeccable:"));
     assert_eq!(fake.hits("/cli/v1/critiques"), 0);
     for flag in ["--json", "--quiet", "--github"] {
         let out = impeccable(
@@ -649,23 +667,59 @@ fn critique_notice_is_once_after_success_and_again_after_sign_in() {
         .output()
         .unwrap();
         assert!(out.status.success());
-        assert!(!String::from_utf8_lossy(&out.stdout).contains(notice));
-        assert!(!String::from_utf8_lossy(&out.stderr).contains(notice));
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("Impeccable:"));
+        assert!(out.stderr.is_empty());
     }
     let before = fake.hits("/cli/v1/critiques");
     assert_eq!(before, 3);
+    let page = |n: usize| {
+        format!(
+            "Saved to Impeccable: {}/app/-/critiques?report=fake{n}",
+            fake.url
+        )
+    };
     let first = write(&env, root);
     assert!(first.status.success());
-    assert!(String::from_utf8_lossy(&first.stdout).ends_with(notice));
-    assert!(!String::from_utf8_lossy(&first.stderr).contains(notice));
-    let second = write(&env, root);
-    assert!(!String::from_utf8_lossy(&second.stdout).contains(notice));
+    assert_eq!(said(&first), page(4) + stop);
+    assert!(first.stderr.is_empty());
+    assert_eq!(said(&write(&env, root)), page(5));
     assert_eq!(fake.hits("/cli/v1/critiques"), before + 2);
     login_with(&env, &["--force"]);
-    assert!(String::from_utf8_lossy(&write(&env, root).stdout).ends_with(notice));
+    assert_eq!(said(&write(&env, root)), page(6) + stop);
+    // A service that answers without a link (its critiques page off) still says it saved.
+    fake.route(
+        "POST",
+        "/cli/v1/critiques",
+        200,
+        vec![],
+        r#"{"outcome":"recorded"}"#,
+    );
+    assert_eq!(said(&write(&env, root)), "Saved to Impeccable.");
 }
 
-const STALE_NOTICE: &str = "Saving to your Impeccable account needs a fresh sign-in. Run impeccable login to turn it on.\n";
+#[test]
+fn signed_out_saves_suggest_signing_in_once_a_day_per_project() {
+    let fake = Fake::start();
+    let env = fake.env("critique-signed-out");
+    let root = Path::new(&env["IMPECCABLE_HOME"]);
+    std::fs::create_dir_all(root).unwrap();
+    std::fs::write(root.join("report.md"), "# Report\nCrowded header.").unwrap();
+    let nudge = "Keep this critique's history: npx impeccable login";
+    assert_eq!(said(&write(&env, root)), nudge);
+    assert_eq!(said(&write(&env, root)), "");
+    // Another project gets its own line the same day.
+    let other = root.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("report.md"), "# Report\nCrowded header.").unwrap();
+    assert_eq!(said(&write(&env, &other)), nudge);
+    // Turned off, or in CI: nothing.
+    let mut ci = env.clone();
+    ci.insert("CI".into(), "1".into());
+    assert_eq!(said(&write(&ci, &other)), "");
+    assert_eq!(fake.hits("/cli/v1/critiques"), 0);
+}
+
+const STALE_NOTICE: &str = "Saving to your Impeccable account needs a fresh sign-in. Run npx impeccable login to turn it on.\n";
 
 #[test]
 fn stale_sign_in_notice_is_shared_and_status_checks_current_offerings() {
@@ -703,25 +757,38 @@ fn stale_sign_in_notice_is_shared_and_status_checks_current_offerings() {
         .unwrap();
         assert!(!String::from_utf8_lossy(&out.stderr).contains(STALE_NOTICE));
     }
+    // A quiet save said nothing, so the shared notice is still owed.
+    let owed = |root: &Path| {
+        std::fs::read_dir(root.join("account"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .flat_map(|d| std::fs::read_dir(d.path()).into_iter().flatten().flatten())
+            .all(|f| !f.file_name().to_string_lossy().starts_with("stale-grant-notice-"))
+    };
+    assert!(owed(root));
     let hook = impeccable(&env, root, &["hook-before-edit"])
         .output()
         .unwrap();
     assert!(!String::from_utf8_lossy(&hook.stderr).contains(STALE_NOTICE));
-    assert_eq!(
-        String::from_utf8_lossy(&write(&env, root).stderr),
-        STALE_NOTICE
-    );
+    // Once the service offers the scope, each save says why it wasn't saved.
+    let cant = "Not saved to Impeccable: this sign-in can't save critiques; sign in again with npx impeccable login";
+    let out = write(&env, root);
+    assert!(out.stderr.is_empty());
+    assert_eq!(said(&out), cant);
     let before = fake.hits(metadata);
-    assert!(write(&env, root).stderr.is_empty());
+    let out = write(&env, root);
+    assert!(out.stderr.is_empty());
+    assert_eq!(said(&out), cant);
     assert_eq!(fake.hits(metadata), before);
     for (args, expected) in [
         (
             vec!["critiques", "status"],
-            "Critique sync: on, but this sign-in can't save yet. Run impeccable login.\n",
+            "Critique sync: on, but this sign-in can't save yet. Run npx impeccable login.\n",
         ),
         (
             vec!["setup", "status"],
-            "Setup status: on, but this sign-in can't save yet. Run impeccable login.\n",
+            "Setup status: on, but this sign-in can't save yet. Run npx impeccable login.\n",
         ),
     ] {
         let out = impeccable(&env, root, &args).output().unwrap();
@@ -756,7 +823,7 @@ fn stale_sign_in_notice_is_shared_and_status_checks_current_offerings() {
         .unwrap();
     assert_eq!(
         String::from_utf8_lossy(&status.stdout),
-        "Design health: on, but this sign-in can't save yet. Run impeccable login.\n"
+        "Design health: on, but this sign-in can't save yet. Run npx impeccable login.\n"
     );
     login(&env);
     let before = fake.hits(metadata);
@@ -800,4 +867,90 @@ fn unavailable_metadata_keeps_plain_status_and_leaves_notice_owed() {
         .dir()
         .join(format!("stale-grant-notice-{}", state.login))
         .exists());
+}
+
+// Catches an audit saved but never uploaded, uploaded unmarked (it would read as a critique out of 40), one whose
+// score cannot be an audit's reaching the account, or a linked file uploaded as an audit.
+#[test]
+fn a_saved_audit_uploads_marked_as_an_audit() {
+    let (fake, env) = setup("audit-upload");
+    let root = Path::new(&env["IMPECCABLE_HOME"]);
+    assert!(impeccable(&env, root, &["critiques", "on"]).output().unwrap().status.success());
+    let audit = |meta: &str| {
+        impeccable(&env, root, &["audit-storage", "write", ".", "report.md"])
+            .env("IMPECCABLE_REPORT_META", meta)
+            .output()
+            .unwrap()
+    };
+    let out = audit(r#"{"target":".","total_score":14,"max_score":20,"p0_count":0,"p1_count":2,"p2_count":3,"p3_count":1}"#);
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("audit"));
+    assert!(audit(r#"{"target":".","total_score":30,"max_score":40,"p0_count":0,"p1_count":0}"#).status.success());
+    // An audit uploads now, so a link in place of its report is refused as a critique's is.
+    #[cfg(unix)]
+    {
+        let outside = std::env::temp_dir().join(format!("audit-outside-{}.md", std::process::id()));
+        std::fs::write(&outside, "Not a report").unwrap();
+        std::fs::remove_file(root.join("report.md")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("report.md")).unwrap();
+        assert!(!audit(r#"{"target":".","total_score":14,"max_score":20,"p0_count":0,"p1_count":0}"#).status.success());
+        std::fs::remove_file(outside).unwrap();
+    }
+    let r = fake.record.lock().unwrap();
+    assert_eq!(r.critiques.len(), 1);
+    let c = &r.critiques[0];
+    assert_eq!((c["kind"].as_str(), c["score"]["max"].as_u64(), c["counts"]["p2"].as_u64()), (Some("audit"), Some(20), Some(3)));
+    assert!(r.critiques.iter().all(|c| c["na"] == serde_json::json!([])));
+}
+
+#[test]
+fn an_accepted_variant_records_the_prototype_once_and_never_when_opted_out() {
+    let (fake, env) = setup("prototype-accept");
+    let root = Path::new(&env["IMPECCABLE_HOME"]);
+    let id = "ab12cd34";
+    std::fs::write(
+        root.join("index.html"),
+        format!(
+            "<!-- impeccable-variants-start {id} -->\n<div data-impeccable-variants=\"{id}\" data-impeccable-variant-count=\"3\" style=\"display: contents\">\n<div data-impeccable-variant=\"original\"><h1>Old</h1></div>\n<div data-impeccable-variant=\"1\"><h1>New</h1></div>\n</div>\n<!-- impeccable-variants-end {id} -->\n"
+        ),
+    )
+    .unwrap();
+    let sessions = root.join(".impeccable/live/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(
+        sessions.join(format!("{id}.jsonl")),
+        format!("{}\n", serde_json::json!({"seq": 1, "id": id, "type": "generate", "ts": "2026-11-16T10:00:00.000Z",
+            "event": {"id": id, "type": "generate", "pageUrl": "http://localhost:5173/pricing?plan=pro#top", "count": 3}})),
+    )
+    .unwrap();
+    let accept = || impeccable(&env, root, &["live-accept", "--id", id, "--variant", "1"]).output().unwrap();
+    // The accept's stdout stays one JSON result and nothing is said on stderr.
+    let first = accept();
+    assert!(first.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(result["handled"], true);
+    assert!(first.stderr.is_empty(), "{}", String::from_utf8_lossy(&first.stderr));
+    // A replayed accept sends the same id, so the service counts it once.
+    assert!(accept().status.success());
+    let sent = fake.record.lock().unwrap().prototypes.clone();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0]["prototypeId"], sent[1]["prototypeId"]);
+    assert_eq!((sent[0]["target"].as_str(), sent[0]["variants"].as_u64()), (Some("/pricing"), Some(3)));
+    // Exactly these keys: no repoKey outside a repository, nothing of the variants.
+    let mut keys: Vec<_> = sent[0].as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    assert_eq!(keys, ["createdAt", "prototypeId", "target", "variants"]);
+    // The replay keeps the first accept's time.
+    assert_eq!(sent[0]["createdAt"], sent[1]["createdAt"]);
+    impeccable(&env, root, &["critiques", "off"]).output().unwrap();
+    assert!(accept().status.success());
+    assert_eq!(fake.hits("/cli/v1/prototypes"), 2);
+    // An accept older than the service's one-day window sends nothing.
+    impeccable(&env, root, &["critiques", "on"]).output().unwrap();
+    let receipt = root.join(format!(".impeccable/live/accept-receipts/{id}.json"));
+    let mut r: serde_json::Value = serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
+    r["completedAt"] = "2026-01-01T00:00:00.000Z".into();
+    std::fs::write(&receipt, r.to_string()).unwrap();
+    assert!(accept().status.success());
+    assert_eq!(fake.hits("/cli/v1/prototypes"), 2);
 }
