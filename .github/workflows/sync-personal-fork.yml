@@ -52,18 +52,18 @@ jobs:
             echo 'changed=false' >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          base="$(git merge-base HEAD FETCH_HEAD)"
-          workflow_changes="$(git diff --name-only "$base" FETCH_HEAD -- .github/workflows)"
-          if [ -n "$workflow_changes" ]; then
-            printf 'Upstream workflow changes need review:\n%s\n' "$workflow_changes" >&2
-            exit 1
-          fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          if ! git merge --no-edit FETCH_HEAD; then
+          if ! git merge --no-ff --no-commit FETCH_HEAD; then
+            git rev-parse --verify -q MERGE_HEAD >/dev/null || exit 1
+          fi
+          if ! git restore --source=HEAD --staged --worktree -- .github/workflows ||
+             [ -n "$(git ls-files --unmerged)" ] ||
+             ! git diff --cached --exit-code HEAD -- .github/workflows; then
             git merge --abort
             exit 1
           fi
+          git commit -m 'Merge upstream Impeccable, preserving fork workflows'
           echo 'changed=true' >> "$GITHUB_OUTPUT"
 
       - name: Publish the merge
