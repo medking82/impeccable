@@ -51,40 +51,36 @@ export const COPY = {
     /** The width a journey runs at: the group, and each choice. */
     width: 'Screen',
     widths: { desktop: 'Desktop', tablet: 'Tablet', phone: 'Phone' },
-    /** How the persona sees the page on this journey (../sight.js): the group, each choice, and what it means (its hover label). */
+    /** How the persona sees the page on this journey (../sight.js): the group, each choice, and what it means (the plan's line). */
     sight: 'Sees',
-    sights: { normal: 'Normal eyes', older: 'Older eyes', 'colour-blind': 'Colour-blind' },
-    sees: { normal: 'Normal eyes: the page as it is', older: 'Older eyes: blurry and low contrast', 'colour-blind': 'Colour-blind: red and green look alike' },
+    sights: { normal: 'Normal eyes', older: 'Blurry, low-contrast vision', 'colour-blind': 'Colour-blind' },
+    sees: { normal: 'Normal eyes: the page as it is', older: 'Blurry, low-contrast vision', 'colour-blind': 'Colour-blind: red and green look alike' },
+    /**
+     * Under each choice's name on hover: how common it is (panel.js `COMMON`). `share` reads "About 5 in 10"; `who` is
+     * the persona's name when its card gives an age, else nothing and the figure is a general one. Colour-blind takes
+     * `men` and `women`, each as 1 in so many.
+     */
+    common: {
+      normal: (share, who) => `${share} ${who ? `people in the US ${who}’s age` : 'adults in the US'} wear glasses or contacts.`,
+      older: (share, who) => `${share} ${who ? `people in the US ${who}’s age` : 'people in the US over 40'} have a cataract.`,
+      'colour-blind': (men, women) => `About 1 in ${men} men and 1 in ${women} women of Northern European descent have red-green colour blindness.`,
+    },
+    share: { about: (n, of) => `About ${n} in ${of}`, fewer: (of) => `Fewer than 1 in ${of}` },
   },
-  /** The first time Create a persona opens: four screens, each a headline and its button, then the box. */
-  intro: {
-    skip: 'Skip',
-    screens: [
-      ['Imagine you’re the persona.', 'I’m imagining it'],
-      ['How do you use the web each day?', 'Next'],
-      ['What drives you mad in apps?', 'Next'],
-      ['And what makes you smile?', 'Tell us'],
-    ],
-  },
+  /** Create a persona's intro: these lines play above the box, one after another, and it stays on the last. */
+  intro: ['Imagine you’re the persona.', 'How do you use the web each day?', 'What drives you mad in apps?', 'And what makes you smile?', 'Now tell us who you are.'],
   /** Make a persona: one description makes one (account/worker.js `create`). A refusal keys on the worker's reason. */
   make: {
-    name: 'Your persona',
-    about: 'Who they are, in a line.',
     describe: 'Who are you, and what do you love or hate in apps?',
     action: 'Create',
-    /** The persona's own device (`home.widths` names each), and one disability: the list's question, then each choice and its line. */
-    device: 'Device',
+    /** The persona's own device (`home.widths` names each), and one disability: each choice and its line. */
+    device: 'Preferred device',
     disability: 'Disability',
-    none: 'None',
-    needs: 'Anything that changes how you use apps?',
     disabilities: {
-      none: ['No disability', ''],
+      none: ['None', ''],
       'low-vision': ['Low vision', 'blurry, low contrast'],
       blind: ['Blind', 'uses a screen reader'],
       'colour-blind': ['Colour-blind', 'red and green look alike'],
-      motor: ['Unsteady hands', 'slow with a mouse'],
-      hearing: ['Hard of hearing', 'needs captions'],
-      cognitive: ['Focus and memory', 'needs things simple'],
     },
     /** On the + once the person has as many of their own as the server allows. */
     full: (max) => `You can make up to ${max || 3} personas for now`,
@@ -189,6 +185,9 @@ export const COPY = {
   yourAgent: {
     line: (name) => `${name || 'Your agent'} is using your browser`,
     wants: (name) => `${name || 'Your agent'} wants to use your browser`,
+    /** Chrome's notice while a site question waits: the panel is where it's answered. */
+    notice: (name, host) => `Let ${name || 'your agent'} use ${host}?`,
+    noticeHow: 'Open the Impeccable side panel to answer.',
     first: (name) => `${name || 'Your agent'} is looking at the page.`,
     opened: (where) => `Opened ${where}`,
     back: 'Went back',
@@ -203,6 +202,10 @@ export const COPY = {
 
   end: {
     done: (name) => `${name || 'Your persona'}’s done.`,
+    // The web's outcome words (src/app-rpc/walk-outcome.ts), REN-2331.
+    through: (name) => `${name || 'Your persona'} got through.`,
+    friction: (name) => `${name || 'Your persona'} got through, with friction.`,
+    partway: (name) => `${name || 'Your persona'} got partway.`,
     stopped: (name) => `You stopped ${name || 'the journey'}.`,
     failed: 'The journey ended.',
     found: (name, n) => `${name || 'Your persona'} found ${issues(n)}`,
@@ -258,15 +261,15 @@ export const COPY = {
   tabGroup: (name) => `Impeccable · ${name}`,
 
   /** The corner of every picture on a journey whose persona sees differently (../sight.js). */
-  seenAs: { older: 'As seen with older eyes', 'colour-blind': 'As seen with colour blindness' },
+  seenAs: { older: 'As seen with blurry, low-contrast vision', 'colour-blind': 'As seen with colour blindness' },
 
-  /** The first time the panel is signed in: two screens, then the home. `points`: [icon, the fact, the fine print]. */
+  /** The first time the panel is signed in: two screens, then the home. `points`: [icon, the fact, the fine print, a link after it: [words, url]]. */
   firstRun: {
     before: {
       title: 'Before you start',
       points: [
         ['cursor', 'It acts in your browser, signed in as you.', 'What it clicks and types counts as you.'],
-        ['camera', 'It takes screenshots of the pages it visits.', 'Keep it off private sites, like banking or health.'],
+        ['camera', 'It records the pages it visits.', 'Screenshots, video and steps go to Impeccable and its AI provider, and are kept for the replay. Keep it off private sites, like banking or health.', ['Privacy policy', 'https://impeccable.style/privacy']],
         ['warn', 'Pages can hide instructions.', 'Text you can’t see can try to steer it somewhere you didn’t ask.'],
         ['shield', 'You approve the plan first.', 'Steps that can’t be undone are marked !. Anything risky that isn’t on the plan is skipped.'],
       ],

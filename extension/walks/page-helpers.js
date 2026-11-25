@@ -137,6 +137,43 @@ function clickByText(wanted, opts) {
     const tag = el.tagName.toLowerCase();
     return tag === "button" || el.getAttribute("role") === "button" || tag === "input" && /^(?:button|submit|reset)$/i.test(el.getAttribute("type") ?? "");
   };
+  const entry = (e) => !!e && (e.tagName.toLowerCase() === "textarea" || e.tagName.toLowerCase() === "input" && !/^(?:checkbox|radio|button|submit|reset|image|file|range|color)$/i.test(e.getAttribute("type") ?? ""));
+  const ownerOf = (e) => !e ? null : e.form !== undefined ? e.form : e.closest?.("form") ?? null;
+  const formOf = (f) => {
+    const form = ownerOf(f);
+    return form && !form.querySelector?.('main, header, [role="main"], [role="banner"]') ? form : null;
+  };
+  const asksSubmit = wantsButton || wantsIcon;
+  const typing = asksSubmit && entry(doc.activeElement) ? formOf(doc.activeElement) : null;
+  const submitIn = (form, e) => !!form && ownerOf(e) === form && (e.tagName.toLowerCase() === "button" ? /^(?:submit)?$/i.test(e.getAttribute("type") ?? "") : e.tagName.toLowerCase() === "input" && /^(?:submit|image)$/i.test(e.getAttribute("type") ?? ""));
+  const sends = (e) => submitIn(typing, e);
+  const nextAt = spoken.findIndex((x, i) => x === "next" && spoken[i + 1] === "to" || x === "beside");
+  const after = nextAt === -1 ? [] : spoken.slice(nextAt + (spoken[nextAt] === "next" ? 2 : 1)), upTo = after.findIndex((x) => /^(?:in|inside|within|on|under|of|for)$/.test(x));
+  const anchor = (upTo === -1 ? after : after.slice(0, upTo)).filter((x) => stop.indexOf(x) === -1 && !SHAPE.test(x) && !/^(?:box|field|input|bar)$/.test(x));
+  const holds = (f) => ` ${norm(`${f.value ?? ""} ${f.getAttribute("aria-label") ?? ""} ${f.getAttribute("title") ?? ""} ${f.getAttribute("placeholder") ?? ""} ${Array.prototype.map.call(f.labels ?? [], (l) => l.textContent ?? "").join(" ")}`)} `;
+  const boxes = anchor.length === 0 || !asksSubmit ? [] : Array.prototype.slice.call(doc.querySelectorAll("input, textarea")).filter((f) => {
+    const b = f.getBoundingClientRect();
+    return entry(f) && !/password/i.test(`${f.getAttribute("type") ?? ""} ${f.getAttribute("autocomplete") ?? ""}`) && !/(?:^|\s)(?:cc-|one-time-code)/.test(f.getAttribute("autocomplete") ?? "") && b.width > 0 && b.height > 0 && anchor.every((x) => holds(f).indexOf(` ${x} `) !== -1);
+  });
+  const box = boxes.length === 1 ? boxes[0].getBoundingClientRect() : null;
+  const gap = (b) => !box ? 0 : Math.max(0, b.left - box.left - box.width, box.left - b.left - b.width) + Math.max(0, b.top - box.bottom, box.top - b.bottom);
+  const buttons = box ? candidates.filter((el) => {
+    const b = el.getBoundingClientRect();
+    return isButton(el) && b.width >= 2 && b.height >= 2;
+  }) : [];
+  const before = nextAt === -1 ? [] : spoken.slice(0, nextAt).filter((x) => stop.indexOf(x) === -1 && !SHAPE.test(x));
+  const shows = (el) => ` ${norm(`${el.innerText || el.textContent || ""} ${el.getAttribute("aria-label") ?? ""} ${el.getAttribute("title") ?? ""} ${el.value ?? ""}`)} `;
+  const far = (el) => gap(el.getBoundingClientRect());
+  const nearest = (pool) => pool.reduce((a, el) => !a || far(el) < far(a) ? el : a, null);
+  const naming = (el) => before.filter((x) => shows(el).indexOf(` ${x} `) !== -1).length;
+  const bestNaming = Math.max(0, ...buttons.map(naming));
+  const namedBeside = bestNaming > 0 ? nearest(buttons.filter((el) => naming(el) === bestNaming)) : null;
+  const others = box ? candidates.filter((el) => el !== boxes[0] && !labelsOf(boxes[0]).includes(el) && el.getBoundingClientRect().width >= 2) : [];
+  const boxSubmit = nearest(others.filter((el) => submitIn(formOf(boxes[0]), el)));
+  const besideTarget = namedBeside ?? (boxSubmit && others.every((el) => el === boxSubmit || far(el) > far(boxSubmit)) ? boxSubmit : null);
+  const sectioning = 'main, article, aside, nav, section, [role="main"]';
+  let outerBars;
+  const outerBar = (tag) => (outerBars ??= new Set(Array.prototype.slice.call(doc.querySelectorAll("header, footer")).filter((b) => !b.closest?.(sectioning)).map((b) => b.tagName.toLowerCase()))).has(tag);
   const wantsSlider = !!opts?.drag && /\b(?:sliders?|faders?|crossfaders?|scrubbers?|range (?:input|control|slider)s?)\b/i.test(wanted);
   const sectionOfPage = (el) => {
     if (el.getAttribute("role") === "tab" || !!el.closest?.('[role="tablist"]'))
@@ -174,9 +211,14 @@ function clickByText(wanted, opts) {
       continue;
     let score = 0;
     let chrome = false;
-    for (const x of words)
-      if (new RegExp(`(?:^|\\s)${carts(x)}(?:\\s|$)`).test(text))
-        score += placeOnly.has(x) ? 0.5 : 1;
+    const ownText = entry(el) && el === doc.activeElement && !el.readOnly ? norm(`${label} ${el.getAttribute("aria-label") ?? ""} ${el.getAttribute("title") ?? ""} ${row} ${labelled}`) : text;
+    for (const x of words) {
+      const at = new RegExp(`(?:^|\\s)${carts(x)}(?:\\s|$)`);
+      if (at.test(text))
+        score += placeOnly.has(x) || !at.test(ownText) ? 0.5 : 1;
+    }
+    if (el === besideTarget)
+      score += 2;
     if (score === 0)
       continue;
     const nameWords = label.split(" ").filter((x) => stop.indexOf(x) === -1), extra = words.filter((x) => !SHAPE.test(x) && ` ${text} `.indexOf(` ${x} `) === -1);
@@ -192,7 +234,10 @@ function clickByText(wanted, opts) {
     if (within && within.contains && within.contains(el))
       score += 3;
     if (el.closest && !sectionOfPage(el)) {
-      const inChrome = !!el.closest('header, footer, [role="banner"], [role="contentinfo"]');
+      let bar = el.closest("header, footer");
+      while (bar && bar.closest?.(sectioning) && outerBar(bar.tagName.toLowerCase()))
+        bar = bar.parentElement?.closest?.("header, footer") ?? null;
+      const inChrome = !!bar || !!el.closest('[role="banner"], [role="contentinfo"]');
       const inSiteNav = !!el.closest('nav, [role="navigation"]') && !el.closest('main, aside, article, section, [role="main"], [role="complementary"]');
       if (inChrome || inSiteNav)
         score -= 1;
@@ -209,6 +254,8 @@ function clickByText(wanted, opts) {
       score += 2;
     if (wantsButton && isButton(el) || wantsIcon && !norm(`${el.innerText || el.textContent || ""}`) || wantsTick && isTick(el) || wantsSwatch && isChoice(el))
       score += 1.5;
+    if (wantsButton && entry(el.tagName.toLowerCase() === "label" ? el.control : el))
+      score -= 1.5;
     const inView = rect.bottom > 0 && rect.top < w.innerHeight;
     if (inView)
       score += 0.5;
@@ -243,6 +290,7 @@ function clickByText(wanted, opts) {
     };
     if (within)
       narrow((n) => !!within.contains && within.contains(n.el), "surface");
+    narrow((n) => sends(n.el), "form");
     narrow((n) => n.inView, "view");
     narrow((n) => n.inView && !!reach(n.el), "reachable");
     narrow((n) => !n.chrome, "page");
@@ -290,6 +338,11 @@ function clickByText(wanted, opts) {
       ambiguous = true;
       if (most > 0 && !top.some((t) => t.own.el === best.el))
         best = top[0].own;
+    }
+    const sent = kin.filter(([el]) => sends(el));
+    if (ambiguous && sent.length === 1 && sent[0][0] === best.el) {
+      by = "form";
+      ambiguous = false;
     }
   }
   let one = false;
@@ -386,16 +439,27 @@ function clickByText(wanted, opts) {
   let covered;
   const hit = doc.elementFromPoint && !reached ? doc.elementFromPoint(point.x, point.y) : null;
   const around = !!hit?.contains?.(best.el);
-  if (hit && !around && hit !== best.el && !best.el.contains?.(hit) && !labelsOf(best.el).some((owner) => inside(owner, hit))) {
+  const stood = best.el.tagName.toLowerCase() === "label" ? best.el.control : best.el;
+  const over = hit?.closest?.(clickable);
+  const [sb, hb, look] = [stood?.getBoundingClientRect(), over?.getBoundingClientRect(), over ? w.getComputedStyle?.(over) : undefined];
+  const opaque = (e) => /^(?:iframe|frame|object|embed|canvas|article|aside|blockquote|body|div|footer|h[1-6]|header|main|nav|p|section|span)$/i.test(e.tagName) || e.tagName.includes("-") || !!e.shadowRoot;
+  const plain = (e) => !!e && /^(?:button|a|input)$/i.test(e.tagName) && (e.tagName.toLowerCase() !== "input" || /^(?:button|submit)$/i.test(e.getAttribute("type") ?? "")) && !opaque(e) && !Array.prototype.slice.call(e.querySelectorAll?.("*") ?? []).some(opaque);
+  const standIn = plain(over) && (hit === over || !opaque(hit)) && !!stood?.disabled && /^(?:input|textarea)$/i.test(stood.tagName) && !!sb && !!hb && hb.width <= sb.width * 2.5 && hb.height <= sb.height * 3 && look?.visibility !== "hidden" && Number(look?.opacity ?? 1) > 0 && Math.abs(hb.left + hb.width / 2 - (sb.left + sb.width / 2)) <= hb.width / 2 && Math.abs(hb.top + hb.height / 2 - (sb.top + sb.height / 2)) <= hb.height / 2;
+  if (hit && !around && !standIn && hit !== best.el && !best.el.contains?.(hit) && !labelsOf(best.el).some((owner) => inside(owner, hit))) {
     const cls = typeof hit.className === "string" ? hit.className.trim().split(/\s+/)[0] : "";
     covered = `${hit.tagName.toLowerCase()}${hit.id ? `#${hit.id}` : cls ? `.${cls}` : ""}`;
   }
+  const landed = !covered && doc.elementFromPoint ? doc.elementFromPoint(point.x, point.y) : null;
+  if (landed && (/^(?:iframe|frame|object|embed|canvas)$/i.test(landed.tagName) || landed.tagName.includes("-") || !!landed.shadowRoot))
+    covered = landed.tagName.toLowerCase();
   if (!opts?.locateOnly)
     best.el.click();
   const aria = norm(best.el.getAttribute("aria-label") ?? "");
   const names = [best.text, aria].filter((n) => n.length > 0);
   const requested = requestedName(best.el);
-  const exact = names.some((n) => n === requested || n.indexOf(requested) === 0 || n.indexOf(` ${requested}`) !== -1);
+  const bare = (s) => s.split(" ").filter((x) => x !== "" && stop.indexOf(x) === -1).join(" ");
+  const nameSaid = bare(spoken.join(" "));
+  const exact = names.some((n) => n === requested || n.indexOf(requested) === 0 || n.indexOf(` ${requested}`) !== -1 || nameSaid !== "" && bare(n) === nameSaid);
   const outside = !!within && !!within.contains && !within.contains(best.el) && within !== best.el;
   const slider = isSlider(best.el);
   const axis = !slider ? undefined : best.el.getAttribute("aria-orientation") === "vertical" ? "y" : best.el.getAttribute("aria-orientation") === "horizontal" || best.el.tagName.toLowerCase() === "input" || r.width >= r.height ? "x" : "y";
@@ -480,7 +544,9 @@ function confirmingControl(at, enter = false, wide = false) {
     const raw = [el.getAttribute("aria-label") ?? "", `${el.innerText || el.textContent || ""}`, el.getAttribute("title") ?? "", tag === "input" && /^(?:submit|button)$/.test(type) ? el.value ?? "" : ""], own = norm(raw[1]);
     const said = [norm(raw[0]), own.length <= 40 ? own : "", norm(raw[2]), norm(raw[3])].filter((s) => s.length > 0), told = whole(raw, said);
     const link = tag === "a" && el.getAttribute("href") !== null && !el.getAttribute("role");
-    if (said.some((s) => changes.test(s) || wide && !link && /\b(?:add|buy|order|checkout|book|post|like|follow|subscribe)\b/.test(s)))
+    const deed = said.some((s) => changes.test(s) || wide && !link && /\b(?:add|buy|order|checkout|book|post|like|follow|subscribe|subscription|purchase|upgrade|donate|erase|trash|deactivate|close (?:my |your |the )?account)\b|^(?:proceed to )?check out(?: now)?$/.test(s));
+    const field = wide && enter && tag !== "button" && !(tag === "input" && /^(?:submit|button|image)$/.test(type));
+    if (deed && !field)
       return wide ? told.join(`
 `) : said[0];
     if (el.getAttribute("role") === "switch" || wide && el.getAttribute("aria-pressed") !== null)
@@ -498,8 +564,12 @@ function confirmingControl(at, enter = false, wide = false) {
       const sub = enter && tag !== "button" && type !== "submit" && type !== "image" && find.querySelector ? find.querySelector('[type="submit"], button:not([type])') : null, subRaw = sub ? [sub.getAttribute("aria-label") ?? "", `${sub.innerText || sub.textContent || ""}`, sub.value ?? ""] : [], all = [...whole(subRaw, subRaw.map(norm).filter((s) => s.length > 0 && s.length <= 40)), ...told];
       if (!reads && sends)
         return wide ? all.length > 0 ? [...all, "<form>"].join(`
-`) : "" : all[0] ?? "the form’s submit button";
+`) : enter && tag !== "button" ? `the form
+<form>` : "" : all[0] ?? "the form’s submit button";
     }
+    if (deed)
+      return told.join(`
+`);
     if (el.closest && el.closest(control) === el) {
       if (wide && said.length === 0 && (tag === "button" || el.getAttribute("role") === "button" || tag === "input" && /^(?:submit|button|image)$/.test(type)))
         return "";
@@ -514,7 +584,7 @@ function currentUrlOf() {
   return globalThis.location.href;
 }
 
-function fieldReads(point, noSecrets = false) {
+function fieldReads(point, noSecrets = false, typedSecrets = false) {
   const doc = globalThis.document;
   const secret = (el, narrow) => el.tagName === "INPUT" && (el.getAttribute("type") ?? "").toLowerCase() === "password" || el.getAttribute("data-impeccable-secret-field") !== null || (el.getAttribute("autocomplete") ?? "").toLowerCase().split(/\s+/).some((t) => t === "current-password" || t === "new-password" || t === "one-time-code" || t.startsWith("cc-")) || !narrow && (el.getAttribute("data-impeccable-secret-maybe") !== null || el.tagName === "INPUT" && !/^(?:checkbox|radio|button|submit|hidden|file|range|color|image|reset|date|datetime-local|month|time|week)$/i.test(el.getAttribute("type") ?? "") && ["name", "id", "placeholder", "aria-label"].some((a) => /passw|pwd/i.test(el.getAttribute(a) ?? "")));
   const holds = (el, narrow) => secret(el, narrow) || Array.from(el.shadowRoot?.querySelectorAll?.("*") ?? []).some((inner) => holds(inner, narrow));
@@ -525,7 +595,7 @@ function fieldReads(point, noSecrets = false) {
     if (!noSecrets || own === null)
       return own;
     const around = [...through, el];
-    return around.some((h) => holds(h, true)) ? null : around.some((h) => holds(h, false)) ? own ? "•" : "" : own;
+    return around.some((h) => holds(h, true)) ? typedSecrets ? own ? "•" : "" : null : around.some((h) => holds(h, false)) ? own ? "•" : "" : own;
   };
   const through = [];
   let at = doc.activeElement ?? null;
@@ -673,7 +743,7 @@ function scrollPageTo(y) {
   globalThis.scrollTo(0, y);
 }
 
-function scrollToSurface(name, scroll = true, headingAlone = false) {
+function scrollToSurface(name, scroll = true) {
   const scope = globalThis;
   const doc = scope.document;
   if (!doc)
@@ -731,7 +801,7 @@ function scrollToSurface(name, scroll = true, headingAlone = false) {
     }
   };
   let label = selectorOf(best.el);
-  if (isHeading(best.el) && !headingAlone) {
+  if (isHeading(best.el)) {
     const LANDMARK = 'section, article, main, form, dialog, [role="region"], [role="main"], [role="dialog"]';
     label = "";
     for (let around = best.el.closest?.(LANDMARK) ?? null;around; around = around.parentElement?.closest?.(LANDMARK) ?? null) {
@@ -749,24 +819,50 @@ function typeInto(wanted, text, keys, noSecrets = false) {
   const doc = w.document;
   const norm = (s) => s.normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").replace(/\s+/g, " ").trim();
   const words = norm(wanted).split(" ").filter((x) => x.length > 1);
-  const fields = Array.prototype.slice.call(doc.querySelectorAll('input:not([type=hidden]):not([type=submit]), textarea, [contenteditable="true"]'));
+  const fields = Array.prototype.slice.call(doc.querySelectorAll('input:not([type=hidden]):not([type=submit]), textarea, [contenteditable="true"]')).filter((el) => {
+    const b = el.getBoundingClientRect();
+    return b.width > 0 && b.height > 0 && !el.disabled && !el.matches?.(":disabled") && !el.readOnly && !el.closest?.("[inert]") && w.getComputedStyle?.(el)?.visibility !== "hidden";
+  });
+  const focused = doc.activeElement;
+  const secret = (el) => el.tagName === "INPUT" && (el.getAttribute("type") ?? "").toLowerCase() === "password" || el.getAttribute("data-impeccable-secret-field") !== null || (el.getAttribute("autocomplete") ?? "").toLowerCase().split(/\s+/).some((t) => t === "current-password" || t === "new-password" || t === "one-time-code" || t.startsWith("cc-"));
+  const asked = norm(wanted);
+  const namedAs = (el) => asked !== "" && [
+    el.getAttribute("placeholder"),
+    el.getAttribute("aria-label"),
+    el.getAttribute("name"),
+    Array.prototype.map.call(el.labels ?? [], (l) => l.textContent ?? "").join(" ")
+  ].some((n) => norm(n ?? "") === asked);
+  const eligible = noSecrets ? fields : fields.filter((el) => !secret(el) || namedAs(el));
   let best = null;
-  for (const el of fields) {
+  let exact = null;
+  let own = -1, ownExact = false;
+  for (const el of eligible) {
     const label = Array.prototype.map.call(el.labels ?? [], (l) => l.textContent ?? "").join(" ");
     const t = norm(`${el.getAttribute("placeholder") ?? ""} ${el.getAttribute("aria-label") ?? ""} ${el.getAttribute("name") ?? ""} ${label}`);
     let score = 0;
     for (const x of words)
       if (t.indexOf(x) !== -1)
         score += 1;
+    const named = namedAs(el);
+    if (el === focused) {
+      own = score;
+      ownExact = named;
+    }
     if (!best || score > best.score)
       best = { el, score };
+    if (named && !exact)
+      exact = { el, score };
   }
   if (!best)
     return null;
-  const focused = doc.activeElement;
-  if (best.score === 0 && focused && fields.includes(focused))
-    best = { el: focused, score: 0 };
-  if (noSecrets && (best.el.tagName === "INPUT" && (best.el.getAttribute("type") ?? "").toLowerCase() === "password" || best.el.getAttribute("data-impeccable-secret-field") !== null || (best.el.getAttribute("autocomplete") ?? "").toLowerCase().split(/\s+/).some((t) => t === "current-password" || t === "new-password" || t === "one-time-code" || t.startsWith("cc-"))))
+  if (focused && own === best.score && eligible.includes(focused) && (!exact || ownExact))
+    best = { el: focused, score: own };
+  else if (exact && exact.score === best.score)
+    best = exact;
+  if (noSecrets && secret(best.el))
+    return null;
+  const labelled = (el) => Array.prototype.some.call(el.labels ?? [], (l) => l.tagName === "LABEL" && norm(l.textContent ?? "") === asked);
+  if (!noSecrets && secret(best.el) && eligible.some((el) => el !== best.el && !secret(el) && (namedAs(el) || labelled(el))))
     return null;
   const was = best.el.getBoundingClientRect();
   best.el.scrollIntoView({ block: "center" });
@@ -1617,6 +1713,294 @@ function viewSize() {
   return { width: Math.round(w.innerWidth), height: Math.round(w.innerHeight) };
 }
 
+function agentSight() {
+  const w = globalThis;
+  const { innerWidth: W, innerHeight: H } = w, MAX = 150;
+  const CONTROL = 'a[href], button, input:not([type=hidden]), select, textarea, summary, [role=button], [role=link], [role=checkbox], [role=radio], [role=switch], [role=tab], [role=menuitem], [role=menuitemcheckbox], [role=menuitemradio], [role=treeitem], [role=option], [role=textbox], [role=combobox], [role=slider], [role=searchbox], [role=spinbutton], [role=listbox], [contenteditable=""], [contenteditable=true], [contenteditable=plaintext-only]';
+  const FIELD = 'input, textarea, select, option, [contenteditable=""], [contenteditable=true], [contenteditable=plaintext-only], [role=textbox], [role=searchbox], [role=combobox], [role=spinbutton], [role=slider], [role=listbox], script, style';
+  const clean = (s) => s.replace(/\s+/g, " ").trim().slice(0, 80);
+  const words = (n) => {
+    if (!n)
+      return "";
+    if (n.nodeType === 3)
+      return n.textContent ?? "";
+    if (n.nodeType !== 1 || n.matches?.(FIELD) || n.isContentEditable)
+      return "";
+    let out = "";
+    for (const c of Array.from(n.childNodes)) {
+      out += ` ${words(c)}`;
+      if (out.length > 200)
+        break;
+    }
+    return out;
+  };
+  const byIds = (el) => clean((el.getAttribute("aria-labelledby") ?? "").split(/\s+/).map((id) => id ? words(w.document.getElementById(id)) : "").join(" "));
+  const roleOf = (el, tag) => {
+    const own = el.getAttribute("role");
+    if (own)
+      return own.split(/\s+/)[0];
+    if (tag === "a")
+      return "link";
+    if (tag === "button" || tag === "summary")
+      return "button";
+    if (tag === "select")
+      return "combobox";
+    if (tag === "textarea")
+      return "textbox";
+    if (tag === "img" || tag === "svg")
+      return "img";
+    if (/^h[1-6]$/.test(tag))
+      return "heading";
+    if (tag === "input") {
+      const t = String(el.type);
+      return t === "checkbox" || t === "radio" ? t : t === "range" ? "slider" : t === "number" ? "spinbutton" : t === "search" ? "searchbox" : /^(?:submit|button|reset|image)$/.test(t) ? "button" : "textbox";
+    }
+    return el.isContentEditable ? "textbox" : "StaticText";
+  };
+  const nameOf = (el, tag, role) => {
+    const named = byIds(el) || clean(el.getAttribute("aria-label") ?? "");
+    if (named)
+      return named;
+    if (role === "img")
+      return clean(el.getAttribute("alt") ?? words(el.querySelector("title")));
+    if (tag === "input" && /^(?:submit|button|reset)$/.test(String(el.type)))
+      return clean(el.value ?? "");
+    if (tag === "input" && el.type === "image")
+      return clean(el.getAttribute("alt") ?? "");
+    if (el.matches(FIELD) || el.isContentEditable || /^(?:textbox|searchbox|combobox|spinbutton|slider|listbox)$/.test(role))
+      return clean(Array.from(el.labels ?? []).map((l) => words(l)).join(" ") || el.getAttribute("title") || el.getAttribute("placeholder") || "");
+    return clean(words(el)) || clean(el.querySelector("img[alt]")?.getAttribute("alt") ?? "") || clean(el.getAttribute("title") ?? "");
+  };
+  const clips = new Map;
+  const clipOf = (el) => {
+    if (!el)
+      return { left: 0, top: 0, right: W, bottom: H };
+    let c = clips.get(el);
+    if (!c) {
+      const cs = w.getComputedStyle(el), up = cs.position === "fixed" ? clipOf(null) : clipOf(el.parentElement);
+      const r = cs.overflowX !== "visible" || cs.overflowY !== "visible" ? el.getBoundingClientRect() : null;
+      c = r ? { left: Math.max(up.left, r.left), top: Math.max(up.top, r.top), right: Math.min(up.right, r.right), bottom: Math.min(up.bottom, r.bottom) } : up;
+      clips.set(el, c);
+    }
+    return c;
+  };
+  const faded = new Map;
+  const gone = (el) => {
+    if (!el)
+      return false;
+    let v = faded.get(el);
+    if (v === undefined) {
+      v = Number(w.getComputedStyle(el).opacity) === 0 || gone(el.parentElement);
+      faded.set(el, v);
+    }
+    return v;
+  };
+  const hidden = (el, native) => w.getComputedStyle(el).visibility === "hidden" || (native ? gone(el.parentElement) : gone(el));
+  const first = [], text = [];
+  const taken = [];
+  const all = w.document.body ? Array.from(w.document.body.querySelectorAll("*")) : [];
+  for (const [at, el] of all.entries()) {
+    if (first.length >= MAX)
+      break;
+    const tag = el.tagName.toLowerCase();
+    const picture = tag === "img" || el.getAttribute("role") === "img";
+    if (/^(?:script|style|noscript|template|option|br|iframe)$/.test(tag) || tag === "svg" && !picture || tag !== "svg" && el.closest("svg"))
+      continue;
+    const b = el.getBoundingClientRect();
+    if (b.width < 2 || b.height < 2 || b.right <= 0 || b.bottom <= 0 || b.left >= W || b.top >= H || taken.some((t) => t.contains(el)))
+      continue;
+    const c = clipOf(el);
+    if (Math.min(b.right, c.right) - Math.max(b.left, c.left) < 2 || Math.min(b.bottom, c.bottom) - Math.max(b.top, c.top) < 2)
+      continue;
+    const control = el.matches(CONTROL);
+    const heading = /^h[1-6]$/.test(tag) || el.getAttribute("role") === "heading";
+    const own = Array.from(el.childNodes).some((n) => n.nodeType === 3 && /\S/.test(n.textContent ?? ""));
+    const cs = w.getComputedStyle(el);
+    let looks = false;
+    if (!control && !heading && !picture) {
+      const pointer = cs.cursor === "pointer" && (!el.parentElement || w.getComputedStyle(el.parentElement).cursor !== "pointer");
+      looks = (pointer || el.hasAttribute("onclick")) && !el.closest(`${CONTROL}, label, [tabindex]`);
+      if (!looks && !own)
+        continue;
+    }
+    if (picture && el.getAttribute("alt") === "" && !el.getAttribute("aria-label") || el.closest('[aria-hidden="true"]') || hidden(el, /^(?:input|select|textarea)$/.test(tag)))
+      continue;
+    const role = looks ? "generic" : roleOf(el, tag);
+    const name = control || heading || picture || looks ? nameOf(el, tag, role) : "";
+    const v = cs.borderTopLeftRadius, n = parseFloat(v) || 0;
+    const r = Math.round(v.endsWith("%") ? Math.min(b.width, b.height) * n / 100 : n);
+    const item = { box: { x: Math.round(b.left), y: Math.round(b.top), width: Math.round(b.width), height: Math.round(b.height) }, role, ...name ? { name } : {}, r, ...looks ? { cantPress: true } : {} };
+    (control || heading || picture || looks ? first : text).push([at, item]);
+    if (control && !/^(?:listbox|tree|treeitem|menu)$/.test(role) || picture)
+      taken.push(el);
+  }
+  const kept = [...first, ...text.slice(0, Math.max(0, MAX - first.length))].sort((a, b) => a[0] - b[0]);
+  return { items: kept.map(([, item]) => item), view: { width: Math.round(W), height: Math.round(H) } };
+}
+
+function armPress(aimed, at, controls) {
+  const w = globalThis;
+  const opaque = (e) => /^(?:iframe|frame|object|embed|canvas)$/i.test(e.tagName) || e.tagName.includes("-") || !!e.shadowRoot;
+  const pointer = (e) => !!e && w.getComputedStyle?.(e)?.cursor === "pointer";
+  const control = (p) => {
+    for (let e = w.document.elementFromPoint(p.x, p.y);e; e = e.parentElement) {
+      if (opaque(e))
+        return;
+      if (e.closest(controls) === e || typeof e.onclick === "function" || pointer(e) && !pointer(e.parentElement))
+        return e;
+    }
+    return null;
+  };
+  const there = control(at), meant = control(aimed);
+  if (!meant || there === undefined)
+    return null;
+  const press = { hit: false };
+  w.__impeccablePress = press;
+  w.addEventListener("click", (e) => {
+    press.hit = Boolean(there && there.contains(e.target));
+  }, { capture: true, once: true });
+  const name = there ? (there.getAttribute("aria-label") || there.innerText || there.textContent || "").replace(/\s+/g, " ").trim().slice(0, 80) || null : null;
+  const href = there?.closest("a[href]")?.getAttribute("href");
+  return { same: there === meant, name, ...there ? { tag: there.tagName.toLowerCase() } : {}, ...href != null ? { href } : {}, ...there && there.closest(controls) !== there ? { informal: true } : {} };
+}
+
+function readPress() {
+  return globalThis.__impeccablePress ?? null;
+}
+
+function skimView(mode, target) {
+  const w = globalThis;
+  const d = w.document;
+  const HOST = "__impeccable-skim";
+  d.getElementById(HOST)?.remove?.();
+  if (mode === "off")
+    return null;
+  const read = w.__impeccableRead ??= new WeakSet;
+  const CRISP = "a,button,h1,h2,h3,h4,h5,h6,[role=heading],[role=button],[role=link],strong,b,label,summary,legend,caption,th";
+  const typed = ["checkbox", "radio", "button", "submit", "hidden", "file", "range", "color", "image", "reset", "date", "datetime-local", "month", "time", "week"].map((t) => `[type="${t}" i]`).join(", ");
+  const named = ["name", "id", "placeholder", "aria-label"].flatMap((a) => ["passw", "pwd"].map((x) => `[${a}*="${x}" i]`)).join(", ");
+  const SKIP = `input, textarea, select, option, [contenteditable=""], [contenteditable=true], [contenteditable=plaintext-only], [role=textbox], [role=searchbox], [role=combobox], [role=spinbutton], [role=slider], [role=listbox], input[type="password" i], [data-impeccable-secret-field], [data-impeccable-secret-maybe], input:not(${typed}):is(${named}), [autocomplete*="password" i], [autocomplete*="one-time-code" i], [autocomplete*="cc-" i]`;
+  const styles = new Map;
+  const style = (el) => {
+    let s = styles.get(el);
+    if (!s)
+      styles.set(el, s = w.getComputedStyle(el));
+    return s;
+  };
+  const blockOf = (el) => {
+    for (let e = el;e; e = e.parentElement)
+      if (!/^(inline|contents)/.test(style(e).display))
+        return e;
+    return null;
+  };
+  const blocks = new Map;
+  const runs = [];
+  const range = d.createRange();
+  const walker = d.createTreeWalker(d.body, 4);
+  for (let n = walker.nextNode();n; n = walker.nextNode()) {
+    const parent = n.parentElement;
+    if (!parent || !/\S/.test(n.data) || /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(parent.tagName) || parent.closest(`#${HOST}`) || parent.isContentEditable || parent.closest(SKIP) || style(parent).visibility === "hidden")
+      continue;
+    const block = blockOf(parent);
+    if (!block)
+      continue;
+    if (mode === "read")
+      runs.push([parent, n.data, block]);
+    const crispHere = Boolean(parent.closest(CRISP)) || Number(style(parent).fontWeight) >= 600;
+    const size = parseFloat(style(parent).fontSize) || 16;
+    const words = blocks.get(block) ?? [];
+    for (const m of n.data.matchAll(/\S+/g)) {
+      range.setStart(n, m.index);
+      range.setEnd(n, m.index + m[0].length);
+      const r = range.getClientRects()[0];
+      if (!r || r.width === 0)
+        continue;
+      const rect = { top: r.top, bottom: r.bottom, left: r.left, right: r.right, width: r.width, height: r.height };
+      words.push({ text: m[0], rect, crisp: crispHere || /\d/.test(m[0]), size });
+    }
+    blocks.set(block, words);
+  }
+  if (mode === "read") {
+    const want = (target ?? "").toLowerCase().match(/[\p{L}\d£$\u20AC.,%]{3,}/gu) ?? [];
+    if (!want.length)
+      return null;
+    const texts = new Map;
+    for (const [at, data, block] of runs) {
+      for (let e = at;e; e = e.parentElement) {
+        if (!blocks.has(e))
+          continue;
+        const t = texts.get(e);
+        if (!t)
+          texts.set(e, { text: data, last: block });
+        else {
+          t.text += (t.last === block ? "" : " ") + data;
+          t.last = block;
+        }
+      }
+    }
+    const textOf = (el) => texts.get(el)?.text ?? "";
+    let best = null;
+    const list = [...blocks.keys()];
+    for (const [i, el] of list.entries()) {
+      const text = textOf(el).toLowerCase();
+      const score = want.filter((t) => text.includes(t)).length / want.length;
+      const under = el.closest("h1,h2,h3,h4,h5,h6,[role=heading]") ? list.slice(i + 1).find((b) => !b.closest("h1,h2,h3,h4,h5,h6,[role=heading]")) : el;
+      const r = el.getBoundingClientRect(), seen = r.bottom > 0 && r.top < w.innerHeight;
+      if (under && score >= 0.5 && (!best || score > best.score || score === best.score && seen && !best.seen))
+        best = { el: under, score, seen };
+    }
+    if (!best)
+      return null;
+    read.add(best.el);
+    const r = best.el.getBoundingClientRect();
+    if (r.top < 0 || r.bottom > w.innerHeight)
+      best.el.scrollIntoView({ block: r.height > w.innerHeight ? "start" : "center", behavior: "instant" });
+    return textOf(best.el).replace(/\s+/g, " ").trim().slice(0, 80);
+  }
+  const kept = [], hidden = [], boxes = [];
+  let keptWords = 0, hiddenWords = 0;
+  for (const [block, words] of blocks) {
+    let readHere = false;
+    for (let e = block;e && !readHere; e = e.parentElement)
+      readHere = read.has(e);
+    const inView = words.filter((x) => x.rect.bottom > 0 && x.rect.top < w.innerHeight && x.rect.right > 0 && x.rect.left < w.innerWidth);
+    if (!inView.length)
+      continue;
+    const first = Math.min(...words.map((x) => x.rect.top)), line = Math.min(...words.map((x) => x.rect.height));
+    const blurred = [];
+    for (const x of inView) {
+      if (readHere || x.crisp || x.rect.top < first + line / 2) {
+        kept.push(x.text);
+        keptWords += 1;
+        continue;
+      }
+      blurred.push(x.text);
+      hiddenWords += 1;
+      const last = boxes[boxes.length - 1];
+      if (last && Math.abs(last.rect.top - x.rect.top) < 2 && Math.max(x.rect.left - last.rect.right, last.rect.left - x.rect.right) < x.size) {
+        const left = Math.min(last.rect.left, x.rect.left), right = Math.max(last.rect.right, x.rect.right);
+        last.rect = { ...last.rect, left, right, width: right - left };
+      } else
+        boxes.push({ rect: { ...x.rect }, size: x.size });
+    }
+    if (blurred.length)
+      hidden.push(blurred.join(" "));
+  }
+  if (mode === "on" && boxes.length) {
+    const host = d.createElement("div");
+    host.id = HOST;
+    Object.assign(host.style, { position: "fixed", inset: "0", pointerEvents: "none", zIndex: "2147483647" });
+    for (const { rect, size } of boxes) {
+      const b = d.createElement("div");
+      const pad = Math.round(size * 0.15);
+      Object.assign(b.style, { position: "absolute", left: `${rect.left - pad}px`, top: `${rect.top - pad / 2}px`, width: `${rect.width + 2 * pad}px`, height: `${rect.height + pad}px`, backdropFilter: `blur(${Math.max(2, size * 0.2).toFixed(1)}px)` });
+      host.appendChild(b);
+    }
+    d.documentElement.appendChild(host);
+  }
+  return { kept: kept.join(" "), hidden, keptWords, hiddenWords };
+}
+
 function coverSecrets(on, forMs) {
   const mark = "--secret-cover";
   const seen = "data-impeccable-secret-field";
@@ -1857,7 +2241,7 @@ function coverHolds() {
   return bare;
 }
 
-export const helpers = Object.freeze({ clickByText, confirmingControl, currentUrlOf, fieldReads, focusedText, pageAddress, pageSignature, scrollBy, scrollPageTo, scrollToSurface, typeInto, controlKeyEvidence, focusedControl, locateChange, restoreClosed, pageLinks, browserLanguage, documentLang, themeReads, readCover, readLanding, relativeStylesMissedInPage, installSystemFace, readConsentState, consentSeen, markConsentSeen, collectA11ySample, documentTitle, letGoOfFocus, secretFocus, viewSize, coverSecrets, coverHolds });
+export const helpers = Object.freeze({ clickByText, confirmingControl, currentUrlOf, fieldReads, focusedText, pageAddress, pageSignature, scrollBy, scrollPageTo, scrollToSurface, typeInto, controlKeyEvidence, focusedControl, locateChange, restoreClosed, pageLinks, browserLanguage, documentLang, themeReads, readCover, readLanding, relativeStylesMissedInPage, installSystemFace, readConsentState, consentSeen, markConsentSeen, collectA11ySample, documentTitle, letGoOfFocus, secretFocus, viewSize, agentSight, armPress, readPress, skimView, coverSecrets, coverHolds });
 
 /** The helpers that read what the consent rules leave in the page's own world: run there. */
 export const pageWorld = Object.freeze(["readConsentState","consentSeen","markConsentSeen"]);
@@ -1866,10 +2250,10 @@ export const pageWorld = Object.freeze(["readConsentState","consentSeen","markCo
 export const newDocument = Object.freeze(["browserLanguage","installSystemFace","loadConsent"]);
 
 /** The helpers that find what lies at a point: the badge hides while one runs, so it is never what they find. */
-export const atAPoint = Object.freeze(["clickByText","confirmingControl","fieldReads","scrollBy","readCover"]);
+export const atAPoint = Object.freeze(["clickByText","confirmingControl","fieldReads","scrollBy","readCover","armPress"]);
 
 /** Each helper's `noSecrets` argument, which this extension always sets: no password, card or one-time-code field is typed into or read. */
 export const noSecrets = Object.freeze({"typeInto":3,"fieldReads":1});
 
 /** This file's and consent-rules.js's hash (sha-256 of the two, this line left out): the hello says it. */
-export const HASH = 'fcdb5b4609b2901d';
+export const HASH = '2b56decfea1ddfd2';

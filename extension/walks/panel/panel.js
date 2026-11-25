@@ -41,17 +41,51 @@ const pre = { personas: undefined, pick: 0, task: '', screen: 'home', plan: null
  * address (`localSite`) always has the six: an app chosen there is for that pick only, never kept.
  */
 Object.assign(pre, { apps: undefined, modal: false, app: null, appsOpen: false, appPersonas: undefined });
-/** Make a persona's own device and disability (`none`, or one of COPY.make.disabilities), whether that list is open, and the intro's screen. */
-Object.assign(pre, { device: 'desktop', disability: 'none', needs: false, intro: 0 });
+/** Make a persona's own device and disability (`none`, or one of COPY.make.disabilities). */
+Object.assign(pre, { device: 'desktop', disability: 'none' });
 /** Each disability's icon. */
-const NEEDS = { none: 'person', 'low-vision': 'glasses', blind: 'blind', 'colour-blind': 'palette', motor: 'hand', hearing: 'ear', cognitive: 'mind' };
-/** Whether the person has seen Create a persona's intro, or skipped it (chrome.storage.local `personaIntroSeen`). */
-let introSeen = true;
+const NEEDS = { none: 'person', 'low-vision': 'glasses', blind: 'blind', 'colour-blind': 'palette' };
 /** The widths a journey may run at (driver.js `DEVICES`, desktop the tab as it is); the last one picked is kept (`walkWidth`). */
 const WIDTHS = ['desktop', 'tablet', 'phone'];
 /** How the persona may see the page (../sight.js), each with its icon; a persona's card names its own (`sees`). */
 const SIGHTS = { normal: 'eye', older: 'glasses', 'colour-blind': 'palette' };
 const SEES_OF = { 'older-eyes': 'older', 'colour-blind': 'colour-blind' };
+/**
+ * How common each sight is in the US, as a percentage by the youngest age of each band (the persona's band is the last
+ * it reaches), and for all ages (`all`). `below`: only a bound is known.
+ */
+const COMMON = {
+  // Adults who wear glasses or contact lenses, NHIS 2016-17, Table 24 of the CDC Vision & Eye Health Surveillance
+  // System's NHIS report (NORC, 2025): https://www.norc.org/content/dam/norc-org/pdfs/NHISDataSummaryReportVEHSS.pdf
+  normal: { bands: [[18, 46.2], [40, 70.3], [65, 84.9], [85, 85.8]], all: 64.0 },
+  // Cataract, 2010 US prevalence by age, NEI "Cataract Tables" (40 and over only; `all` is everyone over 40):
+  // https://web.archive.org/web/20210109114800/https://www.nei.nih.gov/learn-about-eye-health/resources-for-health-educators/eye-health-data-and-statistics/cataract-data-and-statistics/cataract-tables
+  // Under 40, NEI gives no figure. Only 0.5% of adults 18-39 have ever been told they had one (NHIS 2016-17, Table 20 of
+  // the NORC report above), so it stands as a bound.
+  older: { bands: [[18, { below: 1 }], [40, 2.51], [50, 5.22], [55, 9.14], [60, 15.45], [65, 24.73], [70, 36.49], [75, 49.49], [80, 68.3]], all: 17.11 },
+};
+/**
+ * Red-green colour blindness, as 1 in so many: inherited, so the same at every age; among people of Northern European
+ * ancestry. MedlinePlus Genetics (NIH): https://medlineplus.gov/genetics/condition/color-vision-deficiency/
+ */
+const COLOUR_BLIND = { men: 12, women: 200 };
+/** The persona's own age, where its card opens with it ("A 24-year-old …"); an adult's only, else null. */
+function ageOf(person) {
+  for (const text of [person?.role, person?.about]) {
+    const age = Number(/^\s*an?\s+(\d{1,3})[- ]year[- ]old\b/i.exec(text ?? '')?.[1]);
+    if (age >= 18 && age <= 120) return age;
+  }
+  return null;
+}
+/** How common `sees` is, in a line naming the persona where its age is known. */
+function common(sees, person) {
+  if (sees === 'colour-blind') return COPY.home.common[sees](COLOUR_BLIND.men, COLOUR_BLIND.women);
+  const age = ageOf(person);
+  const { bands, all } = COMMON[sees];
+  const share = age === null ? all : bands.findLast(([from]) => age >= from)[1];
+  const words = share.below ? COPY.home.share.fewer(100 / share.below) : share >= 10 ? COPY.home.share.about(Math.round(share / 10), 10) : COPY.home.share.about(1, Math.round(100 / share));
+  return COPY.home.common[sees](words, age === null ? null : person.name);
+}
 /** The screen a persona's card names (`device`), else the width the person last picked (`ownWidth`). */
 const SCREEN_OF = { mobile: 'phone', tablet: 'tablet' };
 let ownWidth = 'desktop';
@@ -104,9 +138,6 @@ const ICONS = {
   glasses: ['M3 14a3.5 3.5 0 1 0 7 0a3.5 3.5 0 1 0-7 0', 'M14 14a3.5 3.5 0 1 0 7 0a3.5 3.5 0 1 0-7 0', 'M10 14c.6-.8 1.3-1.2 2-1.2s1.4.4 2 1.2', 'M3.2 12.8L5.5 6.5h1.5M20.8 12.8L18.5 6.5H17'],
   palette: ['M12 3a9 9 0 1 0 0 18c1.1 0 1.8-.8 1.8-1.7 0-.5-.2-.9-.5-1.2-.3-.3-.5-.7-.5-1.2 0-.9.8-1.7 1.7-1.7H16a5 5 0 0 0 5-5c0-4-4-7.2-9-7.2z', 'M7.5 11.5v.1M10 7.5v.1M14.5 7.5v.1M17 11v.1'],
   blind: ['M3 3l18 18', 'M10.6 5.1A10 10 0 0 1 12 5c6.4 0 10 7 10 7a17 17 0 0 1-2.6 3.5', 'M6.6 6.6C3.7 8.4 2 12 2 12s3.6 7 10 7c1.9 0 3.6-.6 5-1.5', 'M9.9 9.9a3 3 0 0 0 4.2 4.2'],
-  hand: ['M8 13V6.5a1.5 1.5 0 0 1 3 0V11', 'M11 11V4.5a1.5 1.5 0 0 1 3 0V11', 'M14 11V6a1.5 1.5 0 0 1 3 0v6', 'M17 9.5a1.5 1.5 0 0 1 3 0V15a6 6 0 0 1-6 6h-1.3a6 6 0 0 1-4.5-2l-3.4-3.8a1.6 1.6 0 0 1 2.3-2.2L8 14.5'],
-  ear: ['M6 8.5a6.5 6.5 0 1 1 13 0c0 6-6 6-6 10a3.5 3.5 0 1 1-7 0', 'M15 8.5a2.5 2.5 0 0 0-5 0v1a2 2 0 1 1 0 4'],
-  mind: ['M12 5a3 3 0 1 0-6 .1 4 4 0 0 0-2.5 5.8 4 4 0 0 0 .6 6.6A4 4 0 1 0 12 18z', 'M12 5a3 3 0 1 1 6 .1 4 4 0 0 1 2.5 5.8 4 4 0 0 1-.6 6.6A4 4 0 1 1 12 18z', 'M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4'],
   person: ['M12 5.5a1.6 1.6 0 1 0 0-3.2 1.6 1.6 0 0 0 0 3.2z', 'M5 8l7 1.5L19 8', 'M12 9.5V14l-3 7M12 14l3 7'],
   plus: ['M12 5v14M5 12h14'],
   back: ['M19 12H5M11 6l-6 6 6 6'],
@@ -332,6 +363,7 @@ function waitForFaces(round = 0, run = (faceRun += 1)) {
       if (!card) continue;
       for (const [cls, text] of [['name', card.name], ['about', card.about || card.role]]) { const node = hero.querySelector(`.${cls}`); if (node && node.textContent !== text) node.textContent = text; }
     }
+    retip();
     waitForFaces(round + 1, run);
   }, FACE_WAITS[round]);
 }
@@ -416,7 +448,7 @@ function useApp() {
 /** Closes the modal; focus goes back to the button that opened it. */
 const shut = () => { Object.assign(pre, { modal: false, appsOpen: false }); render(); app.querySelector('[data-act="from-app"]')?.focus(); };
 // Escape closes the modal wherever the focus is, and the account popover; on Your personas it answers No.
-document.addEventListener?.('keydown', (event) => { if (event.key === 'Escape' && pre.modal && screen() === 'make') shut(); else if (event.key === 'Escape' && pre.needs && screen() === 'make') closeNeeds(); else if (event.key === 'Escape' && pre.menu) closeMenu(); else if (event.key === 'Escape' && pre.sure && screen() === 'personas') keep(pre.sure); });
+document.addEventListener?.('keydown', (event) => { if (event.key === 'Escape' && pre.modal && screen() === 'make') shut(); else if (event.key === 'Escape' && pre.menu) closeMenu(); else if (event.key === 'Escape' && pre.sure && screen() === 'personas') keep(pre.sure); });
 
 /** "Use a persona from your app": a dropdown of the apps, the one picked's personas, and Use these personas. */
 function appModal() {
@@ -458,8 +490,8 @@ function silhouette() {
 const blank = (cls = '') => el('span', { class: `face blank ${cls}`.trim(), 'aria-hidden': true, style: 'width:112px;height:112px;' }, silhouette());
 
 /**
- * Make a persona, laid out as the home: the face, name and line are placeholders until it's made, shimmer while it's
- * made, then show who was made, with Confirm. Top right, a button to use an app's personas instead.
+ * Make a persona, laid out as the home: the intro plays where the face will be until it's made, a shimmer shows while
+ * it's made, then who was made, with Confirm. Top right, a button to use an app's personas instead.
  */
 function maker() {
   const made = pre.made;
@@ -467,18 +499,24 @@ function maker() {
   box.value = pre.describe;
   box.addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void make(box); } });
   const create = el('button', { class: 'btn btn-gold', type: 'button', 'data-act': 'make', disabled: pre.making, text: COPY.make.action, onclick: () => { void make(box); } });
+  const intro = !made && !pre.making && !ownFull() ? introHero() : null;
   const hero = made ? el('div', { class: 'hero', 'data-slug': made.slug }, face(made, 112), el('span', { class: 'name', text: made.name }), el('p', { class: 'about', text: made.about || made.role }), traits())
     : pre.making ? el('div', { class: 'hero is-making', role: 'status', 'aria-label': COPY.make.making }, blank('skel'), el('span', { class: 'skel skel-name' }), el('span', { class: 'skel skel-line' }), el('span', { class: 'skel skel-line short' }))
-      : el('div', { class: 'hero' }, blank(), el('span', { class: 'name ph', text: COPY.make.name }), el('p', { class: 'about ph', text: COPY.make.about }));
+      : intro?.hero ?? el('div', { class: 'hero' }, blank());
+  // While the intro plays, the box is there but unseen and out of reach; it fades in as the last line settles.
+  const plays = intro && !still();
+  const wait = plays ? intro.left : 0;
+  clearTimeout(introWait);
+  introWait = wait > 0 ? setTimeout(revealBox, wait) : null;
   const parts = [
     el('div', { class: 'top' }, made || pre.making ? null : el('button', { class: 'btn btn-sec sm icon-only', type: 'button', 'data-act': 'back', title: COPY.top.back, 'aria-label': COPY.top.back, onclick: () => goHome() }, icon('back')),
       el('span', { class: 'grow' }),
       made || pre.making || !pre.apps?.length ? null : button('from-app', COPY.make.fromApp, 'sec sm', () => { Object.assign(pre, { modal: true, appsOpen: false, modalSite: siteOf(hereUrl) }); render(); app.querySelector('[data-act="apps"]')?.focus(); })),
     el('div', { class: 'middle' }, hero),
-    made ? el('div', { class: 'box' }, button('confirm', COPY.make.confirm, 'gold full tall', confirmMade)) : el('div', { class: 'box' },
+    made ? el('div', { class: 'box' }, button('confirm', COPY.make.confirm, 'gold full tall', confirmMade)) : el('div', { class: plays ? 'box waits' : 'box', inert: wait > 0, style: plays ? `animation-delay:${wait}ms` : undefined },
             // At the limit, picking an app's personas is all that's left here: the limit stands where the form was.
       ownFull() && !pre.making ? el('p', { class: 'err below', role: 'status', 'data-state': 'full', text: COPY.make.limit(ownMax) }) : [
-        el('div', { class: 'tabs' }, devices(), ...needs()),
+        el('div', { class: 'traits-pick' }, el('p', { class: 'pick-h', id: 'device-h', text: COPY.make.device }), devices(), el('p', { class: 'pick-h', id: 'needs-h', text: COPY.make.disability }), needs()),
         el('div', { class: 'field' }, box, voice ? listening(create) : el('div', { class: 'row' },
           Speech && !pre.making ? micButton() : null,
           el('span', { class: 'grow' }),
@@ -491,30 +529,76 @@ function maker() {
   return [...parts, appModal()];
 }
 
-/** The persona's device on the left, as Home's Screen; on the right, one tab that opens the Disability list. */
+/** How long each of the intro's lines shows, and how much longer the first stays still before the first change. */
+const BEAT = 4000;
+const LEAD = 2000;
+/** When the intro's line and face `i` come in. */
+const due = (i) => i && LEAD + i * BEAT;
+/**
+ * Before one is made, Create a persona's intro plays where its face will be: her faces cross-fade and each line
+ * settles in letter by letter as the one before fades, then it stays on the last. The ring around the face fills
+ * while each line holds, so it shows how long until the next. Every line is drawn at once, stacked,
+ * and CSS plays each at its own delay, timed from when the screen first drew it, so a redraw carries on where it was;
+ * with reduced motion only the last face and line show. The box's own label asks the same, so it is hidden from readers.
+ */
+function introHero() {
+  const at = Date.now() - (pre.shown ??= Date.now());
+  let last = 0;
+  // Letters in words, so a narrow panel wraps a line between words.
+  const lines = COPY.intro.map((text, i) => {
+    let k = 0;
+    const words = text.split(' ').flatMap((word, w) => [w ? ' ' : null, el('span', {}, [...word].map((ch) => {
+      last = due(i) + 160 + (w + k++) * 16;
+      return el('span', { text: ch, style: i ? `animation-delay:${last - at}ms` : undefined });
+    }))]);
+    return el('span', { style: `animation-delay:${due(i + 1) - at}ms` }, words);
+  });
+  // Four faces for COPY.intro's five lines: the fourth stays for the last two. panel.css's ring counts the same lines.
+  const hero = el('div', { class: 'hero intro', 'aria-hidden': 'true', style: `--beat:${BEAT}ms;--lead:${LEAD}ms;--since:${at}ms` },
+    el('span', { class: 'intro-pics' }, [1, 2, 3, 4].map((n, i) => el('img', { class: 'intro-pic', src: `intro/intro-${n}.webp`, alt: '', style: `animation-delay:${due(i) - at}ms` })), ring()),
+    el('span', { class: 'intro-line' }, lines));
+  // `left`: how long until the last line's last letter has settled (panel.css's intro-settle, 700ms).
+  return { hero, left: last + 700 - at };
+}
+
+/** The intro over, the box below it is drawn again within reach, and takes the focus the screen opened with. */
+let introWait = null;
+function revealBox() {
+  introWait = null;
+  if (screen() !== 'make') return;
+  render();
+  if (!document.activeElement || document.activeElement === document.body) app.querySelector('textarea')?.focus();
+}
+
+/** Round the intro's face: a faint track, and a gold arc on it that grows round from the top while each line holds. */
+function ring() {
+  const svg = document.createElementNS(SVG, 'svg');
+  svg.setAttribute('class', 'intro-ring');
+  svg.setAttribute('viewBox', '0 0 170 170');
+  for (const part of ['track', 'arc']) {
+    const circle = document.createElementNS(SVG, 'circle');
+    for (const [key, value] of [['class', part], ['cx', '85'], ['cy', '85'], ['r', '81'], ['pathLength', '100']]) circle.setAttribute(key, value);
+    svg.append(circle);
+  }
+  return svg;
+}
+
+/** Above the box, every choice in sight: the persona's device, and one disability (picked again, it goes back to none). */
 function devices() {
-  return el('div', { class: 'widths', role: 'group', 'aria-label': COPY.make.device }, WIDTHS.map((device) => el('button', {
-    type: 'button', 'data-act': `device-${device}`, 'aria-pressed': pre.device === device ? 'true' : 'false', 'data-tip': COPY.home.widths[device], 'aria-label': COPY.home.widths[device], disabled: pre.making,
+  return el('div', { class: 'seg', role: 'group', 'aria-labelledby': 'device-h' }, WIDTHS.map((device) => el('button', {
+    type: 'button', 'data-act': `device-${device}`, 'aria-pressed': pre.device === device ? 'true' : 'false', disabled: pre.making,
     onclick: () => { pre.device = device; render(); },
-  }, icon(device))));
+  }, icon(device), COPY.home.widths[device])));
 }
 function needs() {
   const chosen = pre.disability;
-  const label = `${COPY.make.disability}: ${COPY.make.disabilities[chosen][0]}`;
-  return [el('div', { class: 'widths sights' },
-    el('button', { class: 'needs-btn', type: 'button', 'data-act': 'needs', 'aria-haspopup': 'dialog', 'aria-expanded': pre.needs ? 'true' : 'false', 'aria-pressed': chosen !== 'none' ? 'true' : 'false', 'aria-label': label, 'data-tip': label, disabled: pre.making,
-      onclick: () => { if (pre.needs) closeNeeds(); else { pre.needs = true; render(); app.querySelector(`[data-act="need-${chosen}"]`)?.focus(); } } },
-    icon(NEEDS[chosen]), chosen === 'none' ? el('span', { class: 'needs-word', text: COPY.make.none }) : null, icon('down'))),
-    ...(pre.needs ? [el('div', { class: 'acct-scrim', 'aria-hidden': true, onclick: () => closeNeeds() }),
-      el('div', { class: 'acct needs-menu', role: 'dialog', 'aria-label': COPY.make.disability },
-        el('p', { class: 'needs-h', text: COPY.make.needs }),
-        Object.entries(COPY.make.disabilities).map(([key, [name, line]]) => el('button', { class: 'need-row', type: 'button', 'data-act': `need-${key}`, 'aria-pressed': key === chosen ? 'true' : 'false',
-          // The one chosen, picked again, goes back to none.
-          onclick: () => { pre.disability = key === chosen ? 'none' : key; closeNeeds(); } },
-        icon(NEEDS[key]), el('span', { class: 'need-t' }, el('b', { text: name }), line ? el('small', { text: line }) : null), key === chosen ? icon('check') : null)))] : [])];
+  return el('div', { class: 'chips', role: 'group', 'aria-labelledby': 'needs-h' }, Object.entries(COPY.make.disabilities).map(([key, [name, line]]) => el('button', {
+    type: 'button', 'data-act': `need-${key}`, 'aria-pressed': key === chosen ? 'true' : 'false', title: line || undefined, 'aria-describedby': line ? `need-${key}-line` : undefined, disabled: pre.making,
+    onclick: () => { pre.disability = key === chosen ? 'none' : key; render(); },
+    // What it means, read out after the name, and shown under the chips while it has keyboard focus: hidden from the
+    // chip's own name, so that stays the word on it.
+  }, icon(NEEDS[key]), name, line ? el('span', { id: `need-${key}-line`, class: 'need-line', 'aria-hidden': 'true', text: line }) : null)));
 }
-/** Closes the Disability list; focus goes back to its tab. */
-function closeNeeds() { pre.needs = false; render(); app.querySelector('[data-act="needs"]')?.focus(); }
 /** Under the persona made: its device and disability, small. */
 const traits = () => el('p', { class: 'traits', 'data-device': pre.device, 'data-disability': pre.disability },
   el('span', {}, icon(pre.device), COPY.home.widths[pre.device]),
@@ -547,10 +631,10 @@ function cast() {
     // At the limit of their own with no app's personas to pick, the + stays (focusable, saying why) and does nothing.
     full ? el('button', { type: 'button', class: 'add', 'aria-disabled': 'true', 'aria-label': COPY.make.full(ownMax), 'data-tip': COPY.make.full(ownMax), 'data-act': 'make-persona', onclick: () => undefined }, el('span', { class: 'face' }, icon('plus')))
       : el('button', { type: 'button', class: 'add', 'aria-label': COPY.home.make, 'data-tip': COPY.home.make, 'data-act': 'make-persona', onclick: () => {
-        Object.assign(pre, { screen: introSeen ? 'make' : 'intro', intro: 0, made: null, note: '', modal: false, app: null, appPersonas: undefined, device: 'desktop', disability: 'none', needs: false });
+        Object.assign(pre, { screen: 'make', shown: undefined, made: null, note: '', modal: false, app: null, appPersonas: undefined, device: 'desktop', disability: 'none' });
         if (BUILD.account && !stubbed) void loadApps();
         render();
-        app.querySelector('[data-act="intro-next"]')?.focus();
+        app.querySelector('textarea')?.focus();
       } },
         el('span', { class: 'face' }, icon('plus'))),
   ], { role: 'group', 'aria-label': COPY.home.who }, people);
@@ -571,7 +655,7 @@ function home() {
   if (pre.personas === undefined) return loading();
   // Every account has personas, the six defaults at least: a list that came back empty is one that didn't load.
   if (!person) return [top(hereUrl, { tools: true }), el('div', { class: 'mid' }, el('p', { class: 'act', text: COPY.home.failed }), unloaded())];
-  const box = el('textarea', { class: 'text scrolls', rows: 3, maxlength: 2000, placeholder: voice ? COPY.voice.listening : COPY.home.ask(person.name), 'aria-label': COPY.home.ask(person.name), oninput: (event) => { pre.task = event.target.value; voice?.retype(pre.task); } });
+  const box = el('textarea', { class: 'text scrolls', rows: 3, maxlength: 2000, placeholder: voice ? COPY.voice.listening : COPY.home.ask(person.name), 'aria-label': COPY.home.ask(person.name), oninput: (event) => { pre.task = event.target.value; voice?.retype(pre.task); askEarly(); } });
   box.value = pre.task;
   const send = () => { hush(); pre.task = (box.value ?? pre.task).trim(); if (pre.task) void plan(); else box.focus(); };
   box.addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); send(); } });
@@ -595,6 +679,8 @@ function home() {
 
 /** Reduced motion: the bars hold a still, gentle arch, and listening still shows. */
 const still = () => globalThis.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches === true;
+// Turned on or off while Create a persona's intro plays: the box under it follows at once (see maker).
+globalThis.matchMedia?.('(prefers-reduced-motion: reduce)')?.addEventListener?.('change', () => { if (screen() === 'make') render(); });
 const STILL = Array.from({ length: BARS }, (_, i) => 0.12 + 0.3 * Math.sin((Math.PI * i) / (BARS - 1)));
 
 /** The mic: press to talk; while listening the same button, selected, stops it. */
@@ -644,12 +730,23 @@ function widths() {
   }, icon(width))));
 }
 
-/** Normal, Older eyes or Colour-blind: how the persona sees the page on this journey alone. */
+/** Normal, blurry and low contrast, or colour-blind: how the persona sees the page on this journey alone; on hover, how common it is. */
 function sights() {
+  const facts = Object.fromEntries(Object.keys(SIGHTS).map((sees) => [sees, common(sees, picked())]));
   return el('div', { class: 'widths sights', role: 'group', 'aria-label': COPY.home.sight }, Object.entries(SIGHTS).map(([sees, look]) => el('button', {
-    type: 'button', 'data-act': `sees-${sees}`, 'aria-pressed': pre.sees === sees ? 'true' : 'false', 'data-tip': COPY.home.sees[sees], 'aria-label': COPY.home.sights[sees],
+    type: 'button', 'data-act': `sees-${sees}`, 'aria-pressed': pre.sees === sees ? 'true' : 'false', 'aria-label': COPY.home.sights[sees], 'aria-description': facts[sees],
     onclick: () => { pre.sees = sees; render(); },
-  }, icon(look))));
+  }, icon(look), el('span', { class: 'tip', 'aria-hidden': 'true' }, el('span', { class: 'tip-h', text: COPY.home.sights[sees] }), el('span', { class: 'tip-fact', text: facts[sees] })))));
+}
+/** The Sees figures again, in place, for a card whose profile came after it was drawn (`waitForFaces`). */
+function retip() {
+  for (const sees of Object.keys(SIGHTS)) {
+    const button = app.querySelector(`[data-act="sees-${sees}"]`);
+    const fact = button?.querySelector('.tip-fact');
+    if (!fact) continue;
+    fact.textContent = common(sees, picked());
+    button.setAttribute('aria-description', fact.textContent);
+  }
 }
 
 /**
@@ -692,6 +789,7 @@ function hear() {
     // The box holds what typing can: a longer talk stops there and says so, rather than going on unseen.
     onText: (text, settled) => {
       pre[words] = text.slice(0, most);
+      if (words === 'task') askEarly();
       const box = app.querySelector('textarea.text');
       // The newest words in view: a long talk outgrows the box.
       if (box) { box.value = pre[words]; box.scrollTop = box.scrollHeight; fade(box); }
@@ -722,13 +820,49 @@ function hush() {
 
 const WHY = COPY.why;
 
-/** Send: the person's task becomes the persona's short plan. */
+/**
+ * The plan asked for while the person pauses writing, before they send it, so the walk usually has its plan ready
+ * (REN-2190: the plan is one model call of about 4 s). Keyed by who walks, the words, the tab, its address and the width;
+ * Send takes it only when all are still the same (a tab gone to another page asks again), else asks again. One the person never sends is dropped here, unsaid. At most
+ * one is asked at a time and {@link EARLY_MAX} between sends: each spends one of the person's plans an hour.
+ */
+const EARLY_PAUSE_MS = 1200;
+const EARLY_MIN = 12;
+const EARLY_MAX = 3;
+let early = null;
+let earlyTimer = null;
+let earlyAsked = 0;
+const planKey = (person, task) => JSON.stringify([refOf(person), task.trim(), here, hereUrl, pre.width]);
+const askPlan = (person, task, isEarly) => chrome.runtime.sendMessage({ account: 'plan', persona: refOf(person), task, tabId: here, device: pre.width, ...(isEarly ? { early: true } : {}) }).catch(() => null);
+function askEarly() {
+  clearTimeout(earlyTimer);
+  earlyTimer = setTimeout(() => {
+    const person = picked();
+    const task = pre.task.trim();
+    // The screen shown, not the home's own state: a walk started elsewhere shows over a home still at 'home'.
+    if (!person || screen() !== 'home' || task.length < EARLY_MIN || earlyAsked >= EARLY_MAX || early?.pending) return;
+    const key = planKey(person, task);
+    if (early?.key === key) return;
+    earlyAsked += 1;
+    const asked = { key, pending: true, answer: askPlan(person, task, true) };
+    // Words changed while this one was asked: the newest are asked once it answers, within the same limits.
+    asked.answer.finally(() => { asked.pending = false; const now = picked(); if (early === asked && now && planKey(now, pre.task) !== asked.key) askEarly(); });
+    early = asked;
+  }, EARLY_PAUSE_MS);
+}
+
+/** Send: the person's task becomes the persona's short plan, the one already asked for when it is still the one wanted. */
 async function plan() {
   const person = picked();
   pre.screen = 'planning';
   pre.note = '';
   render();
-  const answer = await chrome.runtime.sendMessage({ account: 'plan', persona: refOf(person), task: pre.task, tabId: here, device: pre.width }).catch(() => null);
+  clearTimeout(earlyTimer);
+  const ready = early?.key === planKey(person, pre.task) ? early.answer : null;
+  early = null;
+  earlyAsked = 0;
+  const first = ready ? await ready : null;
+  const answer = first?.ok ? first : await askPlan(person, pre.task, false);
   if (pre.screen !== 'planning') return;
   // `runAt`: the width this walk will run at, which is Desktop where the server's word on widths was never heard.
   if (answer?.ok) { pre.plan = answer.plan; pre.runAt = WIDTHS.includes(answer.width) ? answer.width : pre.width; pre.screen = 'plan'; } else { pre.note = WHY[answer?.why] ?? COPY.why.failed; pre.screen = 'home'; }
@@ -873,6 +1007,23 @@ function ease(list, was) {
 const found = () => (view.outcome ? view.outcome.issues.length : view.steps.filter((step) => step.issue).length);
 const resultsUrl = () => view.outcome?.replayUrl ?? walkUrl;
 
+/**
+ * The end screen's face, as the web's outcomes have it (REN-2331, src/app-rpc/walk-outcome.ts): got through is
+ * delighted, with friction or got partway is confused. No verdict (no boolean `finished`) is no mood.
+ */
+function mood(state) {
+  if (state === 'failed') return 'confused';
+  const ending = state === 'done' ? verdict() : null;
+  return ending === 'through' ? 'delighted' : ending ? 'confused' : 'neutral';
+}
+
+/** A finished walk's outcome, as the web names it: through, friction or partway; null with no verdict. */
+function verdict() {
+  const finished = view.outcome?.finished;
+  if (typeof finished !== 'boolean') return null;
+  return !finished ? 'partway' : view.outcome.issues.length ? 'friction' : 'through';
+}
+
 function end() {
   const state = view.state;
   const n = found();
@@ -881,7 +1032,7 @@ function end() {
   const why = reason ? (typeof COPY.failed[reason] === 'function' ? COPY.failed[reason](view.site, name()) : COPY.failed[reason]) : null;
   // The first deed the person said No to (a walk with no plan): the walk's page says it in these words. `held` is not a No.
   const saidNo = view.outcome && !view.outcome.finished ? view.steps.find((step) => step.refused === 'no')?.n : undefined;
-  const head = state === 'done' ? COPY.end.done(name()) : state === 'stopped' ? COPY.end.stopped(name()) : COPY.end.failed;
+  const head = state === 'done' ? COPY.end[verdict() ?? 'done'](name()) : state === 'stopped' ? COPY.end.stopped(name()) : COPY.end.failed;
   const label = n > 0 ? COPY.end.found(name(), n) : COPY.end.see(name());
   // No results page to open (a walk from the terminal that ended early): the way home instead.
   const results = link ? el('button', { class: 'btn btn-gold btn-big', type: 'button', 'data-act': 'results', 'data-issues': String(n),
@@ -892,7 +1043,7 @@ function end() {
     // The way back to the home, in the top row as on every other screen; the results stay one press away below.
     top(view.site ?? hereUrl, { back: () => { ended = true; render(); } }),
     el('div', { class: `end${state === 'done' ? '' : ' is-still'}` },
-      face(walking(), 132, state === 'done' ? 'delighted' : state === 'failed' ? 'confused' : 'neutral'),
+      face(walking(), 132, mood(state)),
       el('h2', { class: 'hd', role: 'status', text: head }),
       why ? el('p', { class: 'err', role: 'alert', text: why }) : saidNo ? el('p', { class: 'line task', text: COPY.end.saidNo(name(), saidNo) }) : view.workflow?.goal ? el('q', { class: 'task', text: view.workflow.goal }) : null),
     el('span', { class: 'grow' }),
@@ -1099,9 +1250,31 @@ async function signOut() {
   render();
 }
 
+/**
+ * After Get Pro, the account is asked again every few seconds for ten minutes, until it has Pro or this screen goes:
+ * the checkout runs in a tab beside the panel, which need not lose or regain focus, and Pro lands a moment after paying.
+ * Only a clear answer is taken (Pro, or signed out): one with no word on Pro (the server out of reach) changes nothing.
+ */
+const PRO_EVERY = 5000;
+const settled = (answer) => answer?.pro === true || answer?.signedIn === false;
+let proUntil = 0;
+let proTimer = null;
+const proAgain = () => { proTimer = setTimeout(() => { if (screen() === 'not-pro' && Date.now() < proUntil) void knowAccount(settled).finally(proAgain); else proTimer = null; }, PRO_EVERY); };
+function awaitPro() {
+  proUntil = Date.now() + 10 * 60 * 1000;
+  if (!proTimer) proAgain();
+}
+/** Asked again on a look (the panel focused, another tab, the tab gone elsewhere): once in 2 s at most, and without Pro, a clear answer only. */
+let lookedAt = -Infinity;
+function relook() {
+  if (Date.now() - lookedAt < 2000) return;
+  lookedAt = Date.now();
+  void knowAccount(screen() === 'not-pro' ? settled : undefined);
+}
+
 /** Signed in without Impeccable Pro, by the server's word: Scan, then Get Pro and another account. */
 const notPro = () => [scanBox(), el('div', { class: 'foot' }, el('p', { class: 'task', text: COPY.notPro.line }),
-  button('get-pro', COPY.notPro.getPro, 'gold full', () => { void chrome.runtime.sendMessage({ account: 'get-pro' }).catch(() => undefined); }),
+  button('get-pro', COPY.notPro.getPro, 'gold full', () => { awaitPro(); void chrome.runtime.sendMessage({ account: 'get-pro' }).catch(() => undefined); }),
   button('another-account', COPY.notPro.other, 'sec full', () => { void signOut(); }))];
 
 /** How to start a walk with no account: the command, and one press to copy it. */
@@ -1118,15 +1291,16 @@ function terminal() {
 /* ------------------------------ first run ------------------------------ */
 
 /** The first time the panel is signed in, before the home: two screens, then never again (chrome.storage.local `firstRunSeen`). */
-const foot = (on, action, text, onclick, n = 2) => el('div', { class: 'fr-foot' },
-  el('div', { class: 'fr-dots', 'aria-hidden': true }, Array.from({ length: n }, (_, i) => el('i', { class: i === on ? 'on' : '' }))),
+const foot = (on, action, text, onclick) => el('div', { class: 'fr-foot' },
+  el('div', { class: 'fr-dots', 'aria-hidden': true }, Array.from({ length: 2 }, (_, i) => el('i', { class: i === on ? 'on' : '' }))),
   button(action, text, 'gold full tall', onclick));
 
 function beforeYouStart() {
   const words = COPY.firstRun.before;
   return [
     el('div', { class: 'fr-mid' }, el('h2', { class: 'hd', text: words.title }),
-      el('ul', { class: 'fr-list' }, words.points.map(([name, fact, more]) => el('li', { class: name === 'warn' ? 'warn' : '' }, icon(name), el('span', {}, el('b', { text: fact }), ' ', more))))),
+      el('ul', { class: 'fr-list' }, words.points.map(([name, fact, more, link]) => el('li', { class: name === 'warn' ? 'warn' : '' }, icon(name),
+        el('span', {}, el('b', { text: fact }), ' ', more, link ? [' ', el('a', { href: link[1], target: '_blank', rel: 'noreferrer', text: link[0] })] : null))))),
     foot(0, 'got-it', words.next, () => { pre.screen = 'tab-group'; render(); }),
   ];
 }
@@ -1142,46 +1316,6 @@ function tabGroup() {
       el('h2', { class: 'hd', text: words.title }), el('p', { class: 'fr-p', text: words.line })),
     foot(1, 'start-walking', words.next, () => { pre.screen = 'home'; void chrome.storage.local.set({ firstRunSeen: true }).catch(() => undefined); render(); }),
   ];
-}
-
-/**
- * Create a persona's intro, the first time it opens: four screens, her face in the ring and a headline, then the box.
- * Every picture and headline is drawn at once, one shown: the tallest headline keeps its room, so nothing moves, and a
- * step swaps them in place (`stepIntro`) and they fade. Skip, or the last button, and it never shows again.
- */
-function intro() {
-  const screens = COPY.intro.screens;
-  const on = pre.intro;
-  return [
-    el('div', { class: 'top' }, el('span', { class: 'grow' }), button('skip-intro', COPY.intro.skip, 'sec sm', endIntro)),
-    el('div', { class: 'fr-mid', 'data-step': String(on) },
-      el('span', { class: 'intro-pics', 'aria-hidden': true }, screens.map((_, i) => el('img', { class: `intro-pic${i === on ? ' on' : ''}`, src: `intro/intro-${i + 1}.webp`, alt: '' }))),
-      el('div', { class: 'intro-lines', 'aria-live': 'polite' }, screens.map(([line], i) => el('h2', { class: `hd intro-line${i === on ? ' on' : ''}`, id: `intro-line-${i}`, text: line })))),
-    describeIntro(foot(on, 'intro-next', screens[on][1], stepIntro, screens.length)),
-  ];
-}
-/** The button is heard with the headline shown above it: focus lands on it, and the headline alone would go unread. */
-function describeIntro(root = app) {
-  root.querySelector('[data-act="intro-next"]')?.setAttribute('aria-describedby', `intro-line-${pre.intro}`);
-  return root;
-}
-function stepIntro() {
-  const screens = COPY.intro.screens;
-  if (pre.intro >= screens.length - 1) { endIntro(); return; }
-  const on = (pre.intro += 1);
-  app.querySelector('.fr-mid')?.setAttribute('data-step', String(on));
-  app.querySelectorAll('.intro-pic').forEach((pic, i) => { pic.className = `intro-pic${i === on ? ' on' : ''}`; });
-  app.querySelectorAll('.intro-line').forEach((line, i) => { line.className = `hd intro-line${i === on ? ' on' : ''}`; });
-  [...(app.querySelector('.fr-dots')?.children ?? [])].forEach((dot, i) => { dot.className = i === on ? 'on' : ''; });
-  app.querySelector('[data-act="intro-next"]').textContent = screens[on][1];
-  describeIntro();
-}
-function endIntro() {
-  introSeen = true;
-  void Promise.resolve(chrome.storage.local.set({ personaIntroSeen: true })).catch(() => undefined);
-  pre.screen = 'make';
-  render();
-  app.querySelector('textarea')?.focus();
 }
 
 /* ------------------------------ drawing ------------------------------ */
@@ -1207,6 +1341,8 @@ function render() {
   // The account popover belongs to the home, and signed out to that screen: another screen closes it.
   if (shown !== 'home' && shown !== 'loading' && shown !== 'signed-out') pre.menu = false;
   // The moment's time runs from when it is first drawn; a stand-in holds it.
+  // Back to no Pro (a Scan walk over) within Get Pro's ten minutes: asked again, as before.
+  if (shown === 'not-pro' && !proTimer && Date.now() < proUntil) proAgain();
   if (shown === 'connected' && !connectedFor && !stubbed) connectedFor = setTimeout(() => { pre.connected = false; connectedFor = null; render(); }, CONNECTED_MS);
   const focused = document.activeElement?.getAttribute?.('data-act');
   const body = document.body;
@@ -1237,7 +1373,7 @@ function render() {
   if (focused) app.querySelector(`[data-act="${focused}"]`)?.focus();
 }
 // The first run's two screens, beside the literal above so that it merges with changes to it.
-Object.assign(SCREENS, { before: beforeYouStart, 'tab-group': tabGroup, history, personas: yours, intro });
+Object.assign(SCREENS, { before: beforeYouStart, 'tab-group': tabGroup, history, personas: yours });
 
 /** Which tab this panel's window shows: asked when the panel opens, each time another tab comes to the front, and as it loads. */
 async function look() {
@@ -1246,9 +1382,12 @@ async function look() {
   hereUrl = tab?.url ?? '';
 }
 
-async function knowAccount() {
+/** `taken`: whether to take this answer; every answer, but for Get Pro's rechecks. */
+async function knowAccount(taken = () => true) {
   const answer = await chrome.runtime.sendMessage({ account: 'status' }).catch(() => null);
-  const was = account?.signedIn === true;
+  if (!taken(answer)) return;
+  // Pro come just now (Get Pro paid for) counts as just signed in: no personas were asked for without it.
+  const was = account?.signedIn === true && account.pro !== false;
   const before = screen();
   account = answer?.ok === true && answer.available === true ? answer : null;
   if (account?.signedIn === true && account.pro !== false && (!was || pre.personas === null)) void loadPersonas();
@@ -1268,7 +1407,6 @@ async function start() {
   const stub = BUILD.devHosts ? params.get('stub') : null;
   const { walkWidth } = await Promise.resolve(chrome.storage?.local?.get('walkWidth')).catch(() => null) ?? {};
   if (WIDTHS.includes(walkWidth)) pre.width = ownWidth = walkWidth;
-  introSeen = (await Promise.resolve(chrome.storage?.local?.get('personaIntroSeen')).catch(() => null))?.personaIntroSeen === true;
   if (stub !== null) {
     const { STUBS, PRE, HISTORY, FEED } = await import('./stub.js');
     stubbed = true;
@@ -1324,15 +1462,16 @@ async function start() {
       clearTimeout(settling);
       settling = setTimeout(() => { if (siteOf(hereUrl) !== asked && screen() === 'home' && pre.personas !== undefined && account?.signedIn === true && account.pro !== false) void loadPersonas(); }, 500);
     };
-    chrome.tabs.onActivated.addListener(() => { void look().then(() => { moved(); render(); }); });
+    // Without Pro, back from another tab or the tab gone elsewhere (paid there, maybe): asked again.
+    chrome.tabs.onActivated.addListener(() => { if (screen() === 'not-pro') relook(); void look().then(() => { moved(); render(); }); });
     // Scan names the tab's site: drawn again only when the site changes, as a redraw moves its box.
-    chrome.tabs.onUpdated?.addListener((tabId, change) => { if (tabId === here && change.url) { const site = hostOf(hereUrl) !== hostOf(change.url); hereUrl = change.url; moved(); if ((pre.screen === 'home' || (pre.screen === 'scan' && site)) && !isLive(view)) render(); } });
+    chrome.tabs.onUpdated?.addListener((tabId, change) => { if (tabId === here && change.url) { if (screen() === 'not-pro') relook(); const site = hostOf(hereUrl) !== hostOf(change.url); hereUrl = change.url; moved(); if ((pre.screen === 'home' || (pre.screen === 'scan' && site)) && !isLive(view)) render(); } });
     const [{ view: kept }, { connected: just } = {}] = await Promise.all([chrome.storage.session.get('view'), Promise.resolve(chrome.storage.session.get('connected')).catch(() => ({})), look(), knowWalk()]);
     if (kept?.v === 1) view = kept;
     if (just === true) connect();
     if (!(await chrome.storage.local.get('firstRunSeen').catch(() => ({}))).firstRunSeen) pre.screen = 'before';
     // Asked again whenever the panel is looked at: a sign-in in the popup shows here.
-    if (BUILD.account) { void knowAccount(); addEventListener('focus', () => { void knowAccount(); }); }
+    if (BUILD.account) { void knowAccount(); addEventListener('focus', relook); }
     // Wakes a worker Chrome put to sleep, so a walk it lost is not shown as still going.
     act('hello');
   }
